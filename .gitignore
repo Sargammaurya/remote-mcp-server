@@ -1,0 +1,16 @@
+# local settings and secrets
+.env
+*.token
+tokens/
+
+# runtime data: workspaces, logs, Bruin HOME, scratch
+var/
+
+# the Bruin binary is fetched by scripts/fetch_bruin.sh, not committed;
+# VERIFIED.txt and the checksums file are kept
+vendor/bruin/*/bruin
+
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/

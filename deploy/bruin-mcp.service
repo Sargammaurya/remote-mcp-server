@@ -1,0 +1,49 @@
+# NOT INSTALLED. Proposed system unit for a later, separately approved phase.
+#
+# Option (b) from the Phase 2 plan: a system unit running as the service user,
+# so it does not depend on systemd user lingering. Installing it needs root:
+#   install -m 0644 deploy/bruin-mcp.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now bruin-mcp
+# Replace /srv/bruin-mcp-service with the checkout path, and review .env
+# (BMCP_ENV, bind address, public URL) before any non-loopback use.
+
+[Unit]
+Description=Shared Bruin MCP service
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=sargam
+Group=sargam
+WorkingDirectory=/srv/bruin-mcp-service/src
+EnvironmentFile=/srv/bruin-mcp-service/.env
+ExecStart=/srv/bruin-mcp-service/.venv/bin/python -I -m bruin_mcp_service.server
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+UMask=0077
+
+# resource limits
+MemoryMax=8G
+CPUQuota=800%
+TasksMax=256
+LimitNOFILE=4096
+
+# hardening (the service only writes under var/)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/srv/bruin-mcp-service/var
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

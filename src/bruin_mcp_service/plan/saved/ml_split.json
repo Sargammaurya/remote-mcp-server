@@ -1,0 +1,36 @@
+{
+  "name": "ml_split",
+  "description": "Remove duplicate records by id, require a target value, and split deterministically into train/test by a hash of the id. Use ONLY when the user asked for a split; feature engineering and training stay with the client's ML tools.",
+  "parameters": {
+    "dataset_id": "uploaded CSV/XLSX",
+    "id_column": "column identifying a record (duplicates of an id are removed; the split hashes it)",
+    "target_column": "column the model will predict (rows without it are removed)",
+    "test_fraction": "share of rows for the test part, e.g. 0.2",
+    "train_fraction": "1 - test_fraction, e.g. 0.8"
+  },
+  "plan": {
+    "name": "ml_split",
+    "description": "Saved plan: ml_split",
+    "sources": [{"table": "records", "dataset_id": "{{dataset_id}}"}],
+    "clean": [{
+      "table": "records",
+      "steps": [
+        {"op": "trim", "columns": ["{{id_column}}", "{{target_column}}"]},
+        {"op": "null_if", "columns": ["{{id_column}}", "{{target_column}}"], "values": [""]},
+        {"op": "filter", "where": {"all": [
+          {"column": "{{id_column}}", "operator": "not_null"},
+          {"column": "{{target_column}}", "operator": "not_null"}]}},
+        {"op": "dedupe", "key": ["{{id_column}}"], "order_by": ["{{id_column}}"]}
+      ],
+      "checks": [
+        {"column": "{{id_column}}", "check": "unique"},
+        {"column": "{{target_column}}", "check": "not_null"}
+      ]
+    }],
+    "outputs": [{
+      "kind": "split", "name": "records", "source": "clean.records", "key": "{{id_column}}",
+      "parts": {"train": "{{train_fraction}}", "test": "{{test_fraction}}"}, "seed": 42
+    }],
+    "exports": [{"asset": "mart.records_train"}, {"asset": "mart.records_test"}]
+  }
+}

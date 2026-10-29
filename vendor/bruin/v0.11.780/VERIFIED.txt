@@ -1,0 +1,9 @@
+version=v0.11.780
+commit=17f7ab547d009bf581260d7b346d02fff58846f9
+binary_sha256=0171988d847374c67f3331fa6fe1cf0f6730c2c424cadf5cc5df221f54cb31c5
+tarball=bruin_Linux_x86_64.tar.gz
+tarball_sha256=0e92ab1e4116a83fe3e3a85ea4af5b6a7fd404adc461026d8dce082b11c28a8c
+checksums_file_sha256=91e256fd36a8ee3217282a2dd681a42979fdf8dc84425643afd1d0efd4a111c6
+source=https://github.com/bruin-data/bruin/releases/download/v0.11.780
+verified_at=2026-10-22T09:08:48Z
+note=hashes recorded from the GitHub release for this tag; integrity check only, not independent authentication

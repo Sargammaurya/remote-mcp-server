@@ -1,0 +1,41 @@
+{
+  "name": "invoice_cleanup",
+  "description": "Clean an invoice extract (one row per invoice line or invoice) and total it per customer and currency. Replaces the old fixed invoice pipeline: same engine as every other plan, with the column names and date formats supplied as parameters.",
+  "parameters": {
+    "dataset_id": "uploaded invoice CSV/XLSX",
+    "invoice_id_column": "column holding the invoice id (one row kept per id)",
+    "customer_column": "column holding the customer name",
+    "currency_column": "column holding the currency code",
+    "amount_column": "column holding the amount (may contain currency symbols or thousands separators)",
+    "date_column": "column holding the invoice date",
+    "date_formats": "list of strftime formats the dates are written in, e.g. [\"%Y-%m-%d\", \"%d/%m/%Y\"] — states the day/month order explicitly"
+  },
+  "plan": {
+    "name": "invoice_cleanup",
+    "description": "Saved plan: invoice_cleanup",
+    "sources": [{"table": "invoices", "dataset_id": "{{dataset_id}}"}],
+    "clean": [{
+      "table": "invoices",
+      "steps": [
+        {"op": "trim", "columns": ["{{invoice_id_column}}", "{{customer_column}}", "{{currency_column}}", "{{amount_column}}", "{{date_column}}"]},
+        {"op": "change_case", "columns": ["{{currency_column}}"], "to": "upper"},
+        {"op": "null_if", "columns": ["{{amount_column}}", "{{invoice_id_column}}"], "values": [""]},
+        {"op": "strip_chars", "columns": ["{{amount_column}}"], "chars": "$€£₹,"},
+        {"op": "cast", "columns": {"{{amount_column}}": "DOUBLE"}},
+        {"op": "parse_date", "columns": ["{{date_column}}"], "formats": "{{date_formats}}"},
+        {"op": "dedupe", "key": ["{{invoice_id_column}}"], "order_by": ["{{date_column}}"], "keep": "last"}
+      ],
+      "checks": [
+        {"column": "{{invoice_id_column}}", "check": "not_null"},
+        {"column": "{{invoice_id_column}}", "check": "unique"},
+        {"column": "{{amount_column}}", "check": "not_null"}
+      ]
+    }],
+    "outputs": [{
+      "kind": "aggregate", "name": "invoice_totals", "source": "clean.invoices",
+      "group_by": ["{{customer_column}}", "{{currency_column}}"],
+      "measures": [{"name": "invoices", "fn": "count"}, {"name": "total_amount", "fn": "sum", "column": "{{amount_column}}"}]
+    }],
+    "exports": [{"asset": "clean.invoices"}, {"asset": "mart.invoice_totals"}]
+  }
+}
