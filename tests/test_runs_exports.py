@@ -135,6 +135,84 @@ def test_the_sandbox_denies_other_users_data_and_service_secrets(settings, built
     assert "PASS clean.orders" in text                            # the legitimate asset still ran
 
 
+def test_the_launcher_caps_the_commands_memory():
+    probe = ["/usr/bin/python3", "-I", "-c", "import resource; print(resource.getrlimit(resource.RLIMIT_DATA))"]
+    out = subprocess.run(sandbox.command(sys.executable, probe, data_mb=512), capture_output=True, text=True,
+                         timeout=60)
+    assert out.stdout.strip() == f"({512 * 2 ** 20}, {512 * 2 ** 20})"
+    bad = subprocess.run(sandbox.command(sys.executable, probe, data_mb=0), capture_output=True, text=True,
+                         timeout=60)
+    assert bad.returncode == 2 and "refusing to run" in bad.stderr and bad.stdout == ""
+
+
+def test_a_run_over_its_memory_limit_fails_cleanly_and_says_why(settings, built, monkeypatch):
+    """A real Bruin asset over --data-mb fails with DuckDB's own error (it used 26 GB
+    unlimited); runs.start then names the limit."""
+    record, ds = built
+    root = _root(settings, record["pipeline_id"])
+    (root / "pipeline/assets/clean/heavy.sql").write_text(
+        "/* @bruin\nname: clean.heavy\ntype: duckdb.sql\nmaterialization:\n  type: table\n@bruin */\n"
+        "SELECT count(DISTINCT i::VARCHAR || '-pad-pad') AS n FROM range(100000000) t(i)\n")
+    ds_dir = settings.workspace_root / "users/alice/datasets" / ds
+    cmd = sandbox.command(sys.executable, [str(settings.bruin_bin), "run", "--config-file",
+                                           str(root / ".bruin.yml"), "--no-color", str(root / "pipeline")],
+                          ro=[settings.bruin_bin.parent, settings.bruin_home, ds_dir], rw=[root], data_mb=1024)
+    started = time.monotonic()
+    out = subprocess.run(cmd, cwd=root, env=bruin_env(settings), capture_output=True, text=True, timeout=300)
+    assert out.returncode != 0 and "Out of Memory" in out.stdout + out.stderr
+    assert time.monotonic() - started < 120
+    (root / "pipeline/assets/clean/heavy.sql").unlink()
+
+    fake = subprocess.CompletedProcess([], 1, "FAIL clean.orders\n└── Out of Memory Error: Allocation failure\n", "")
+    monkeypatch.setattr(runs.subprocess, "run", lambda *a, **k: fake)
+    run = _wait(settings, "alice", record["pipeline_id"], runs.start(settings, "alice", record["pipeline_id"])["run_id"])
+    assert run["status"] == "failed"
+    assert run["errors"][0].startswith("the run needed more than the service's 4096 MB per run (BMCP_RUN_MEMORY_MB)")
+
+
+def test_a_run_reports_exactly_what_it_changed(settings):
+    # live run: "verified via sample comparison" that satisfaction was unchanged; all
+    # 100 values had gone from 'True'/'False' to 'true'/'false', and a trim changed nothing
+    csv_text = "id,label,flag,amount,delay\n1, a ,True,5,0.0\n2,b,False,x,0.0\n3,b,True,2.5,7\n3,b,True,2.5,7\n"
+    ds = datasets.upload(settings, "alice", "flags.csv", b64(csv_text))["dataset_id"]
+    record = _build(settings, "alice", {
+        "name": "flags", "sources": [{"table": "t", "dataset_id": ds}],
+        "clean": [{"table": "t", "steps": [
+            {"op": "trim", "columns": ["label", "flag"]},
+            {"op": "rename", "mapping": {"label": "tag"}},
+            {"op": "cast", "columns": {"id": "INTEGER", "flag": "BOOLEAN", "amount": "INTEGER", "delay": "BIGINT"}},
+            {"op": "dedupe"},
+            {"op": "filter", "where": {"column": "id", "operator": "ne", "value": 2}}]}]})
+    run = _wait(settings, "alice", record["pipeline_id"], runs.start(settings, "alice", record["pipeline_id"])["run_id"])
+    assert run["status"] == "succeeded"
+    got = run["changes"]["clean.t"]
+    assert got["rows"] == {"before": 4, "after": 2, "removed_by": {"step 4 (dedupe)": 1, "step 5 (filter)": 1}}
+    assert got["renamed"] == {"label": "tag"} and "dropped" not in got and "added" not in got
+    assert got["retyped"] == {"id": "VARCHAR → INTEGER", "flag": "VARCHAR → BOOLEAN", "amount": "VARCHAR → INTEGER",
+                             "delay": "VARCHAR → BIGINT"}
+    by = {(e["step"], e["column"]): e for e in got["by_step"]}
+    assert by[("1 (trim)", "label")] == {"step": "1 (trim)", "column": "label", "rows_changed": 1,
+                                         "examples": [{"from": " a ", "to": "a", "rows": 1}]}
+    assert by[("1 (trim)", "flag")]["rows_changed"] == 0                           # said, not implied
+    assert by[("3 (cast)", "flag")]["became_null"] == 0 and by[("3 (cast)", "flag")]["written_differently"] == 4
+    assert by[("3 (cast)", "flag")]["examples"] == [{"from": "True", "to": "true", "rows": 3},
+                                                    {"from": "False", "to": "false", "rows": 1}]
+    amount = by[("3 (cast)", "amount")]
+    assert amount["became_null"] == 3 and amount["written_differently"] == 0        # '2.5' is not rounded to 3
+    assert amount["not_converted"] == [{"from": "2.5", "to": None, "rows": 2}, {"from": "x", "to": None, "rows": 1}]
+    assert by[("3 (cast)", "id")]["written_differently"] == 0 and "reformatted" not in by[("3 (cast)", "id")]
+    delay = by[("3 (cast)", "delay")]                     # live: 100 cells '0.0' → '0' went unreported
+    assert delay["written_differently"] == 0 and delay["reformatted"] == 2
+    assert delay["reformatted_examples"] == [{"from": "0.0", "to": "0", "rows": 2}]
+
+
+def test_a_report_that_cannot_be_made_does_not_change_the_runs_outcome(settings, built, monkeypatch):
+    record, _ = built
+    monkeypatch.setattr(runs, "run_changes", lambda *a: 1 / 0)
+    run = _wait(settings, "alice", record["pipeline_id"], runs.start(settings, "alice", record["pipeline_id"])["run_id"])
+    assert run["status"] == "succeeded" and run["changes"] == {"error": "changes could not be computed: ZeroDivisionError"}
+
+
 def test_a_second_run_of_the_same_pipeline_waits_its_turn(settings, built):
     record, _ = built
     first = runs.start(settings, "alice", record["pipeline_id"])

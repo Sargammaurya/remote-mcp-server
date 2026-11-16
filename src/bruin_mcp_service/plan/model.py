@@ -439,7 +439,8 @@ def plan_format() -> dict:
         "steps": step_fields(),
         "step_notes": {
             "all": "every source column starts as VARCHAR; each step sees only the previous step's columns",
-            "cast": "columns is an object {column: TYPE}; TRY_CAST, so failures become NULL",
+            "cast": "columns is an object {column: TYPE}; TRY_CAST, so failures become NULL; to INTEGER or "
+                    "BIGINT a number with a fraction (3.5) becomes NULL, not rounded — use DOUBLE to keep it",
             "parse_date": "formats are strftime patterns tried in order; they state the day/month order",
             "dedupe": "no key: exact duplicate rows; key: one row per key, ordered by order_by, keep first|last",
             "derive": "expression is a SQL expression over existing columns; give type if it cannot be inferred",
@@ -447,7 +448,8 @@ def plan_format() -> dict:
         },
         "types": list(SQL_TYPES),
         "condition": "{column, operator: eq|ne|gt|ge|lt|le|in|not_in|is_null|not_null|like, value} "
-                     "or {all: [conditions]} or {any: [conditions]}",
+                     "or {all: [conditions]} or {any: [conditions]}; ne and not_in keep rows where the "
+                     "column is missing (NULL) — add a not_null condition to drop those too",
         "checks": "{column, check: not_null|unique|accepted_values|positive|non_negative|min|max|pattern, value?}",
         "outputs": {
             "aggregate": "{kind: aggregate, name, source: 'clean.<table>', group_by: [...], "
@@ -496,6 +498,25 @@ class TablePlan(_Strict):
             "outputs": [o.model_dump(mode="json", exclude_none=True) for o in self.outputs],
             "exports": [e.model_dump(mode="json") for e in self.exports],
         })
+
+
+def json_argument(name: str, value: Any) -> Any:
+    """A list argument the model sent as a JSON string.
+
+    A VALID string is already parsed by FastMCP before the tool runs; one that
+    is not valid JSON used to be refused with pydantic's "Input should be a
+    valid list", which hides the real fault — a live run's steps string had
+    lost its closing ']'. Say where it breaks instead.
+    """
+    if not isinstance(value, str):
+        return value
+    import json
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as e:
+        near = value[max(0, e.pos - 40):e.pos + 20]
+        raise ValueError(f"{name} is a JSON string that does not parse: {e.msg} at character {e.pos} "
+                         f"(near {near!r}); send {name} as a JSON array, not a string") from None
 
 
 def parse_table_plan(arguments: dict) -> Plan:

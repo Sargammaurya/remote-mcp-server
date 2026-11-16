@@ -47,6 +47,13 @@ class Settings:
     max_concurrency: int
     run_timeout_s: int
     max_runs: int
+    # DuckDB resources: per query (inspect, validate probes) and per pipeline run, so
+    # one dataset cannot take the machine's memory (a 3,001-column inspect used 25 GB)
+    query_memory_mb: int = 2048
+    query_threads: int = 4
+    query_spill_gb: int = 10
+    run_memory_mb: int = 4096
+    max_columns: int = 1000
 
     @property
     def max_upload_bytes(self) -> int:
@@ -59,6 +66,12 @@ class Settings:
     @property
     def user_quota_bytes(self) -> int:
         return self.user_quota_gb * 1024 ** 3
+
+
+def duckdb_limits(settings: Settings) -> dict:
+    """Config for the service's own duckdb connections (run stats, exports): the query caps."""
+    return {"memory_limit": f"{settings.query_memory_mb}MB", "threads": settings.query_threads,
+            "max_temp_directory_size": f"{settings.query_spill_gb}GB"}
 
 
 def _required(env: Mapping[str, str], key: str) -> str:
@@ -160,4 +173,9 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         max_concurrency=_positive_int(env, "BMCP_MAX_CONCURRENCY", default=8, maximum=256),
         run_timeout_s=_positive_int(env, "BMCP_RUN_TIMEOUT_S", default=600, maximum=7200),
         max_runs=_positive_int(env, "BMCP_MAX_RUNS", default=2, maximum=32),
+        query_memory_mb=_positive_int(env, "BMCP_QUERY_MEMORY_MB", default=2048, maximum=1024 * 1024),
+        query_threads=_positive_int(env, "BMCP_QUERY_THREADS", default=4, maximum=256),
+        query_spill_gb=_positive_int(env, "BMCP_QUERY_SPILL_GB", default=10, maximum=10_000),
+        run_memory_mb=_positive_int(env, "BMCP_RUN_MEMORY_MB", default=4096, maximum=1024 * 1024),
+        max_columns=_positive_int(env, "BMCP_MAX_COLUMNS", default=1000, maximum=100_000),
     )

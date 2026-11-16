@@ -79,3 +79,17 @@ def test_input_ext_subset_ok(base_env):
 def test_input_ext_unsupported_refused(base_env):
     with pytest.raises(ConfigError, match="BMCP_ALLOWED_INPUT_EXT"):
         load_settings({**base_env, "BMCP_ALLOWED_INPUT_EXT": ".csv,.parquet"})
+
+
+def test_duckdb_resource_limits_have_defaults_and_can_be_set(base_env):
+    from bruin_mcp_service.config import duckdb_limits
+    s = load_settings(base_env)
+    assert (s.query_memory_mb, s.query_threads, s.query_spill_gb, s.run_memory_mb, s.max_columns) == \
+        (2048, 4, 10, 4096, 1000)
+    assert duckdb_limits(s) == {"memory_limit": "2048MB", "threads": 4, "max_temp_directory_size": "10GB"}
+    s = load_settings({**base_env, "BMCP_QUERY_MEMORY_MB": "512", "BMCP_RUN_MEMORY_MB": "1024",
+                       "BMCP_QUERY_THREADS": "2", "BMCP_MAX_COLUMNS": "50"})
+    assert (s.query_memory_mb, s.run_memory_mb, s.query_threads, s.max_columns) == (512, 1024, 2, 50)
+    for bad in ("0", "-1", "lots"):
+        with pytest.raises(ConfigError, match="BMCP_QUERY_MEMORY_MB"):
+            load_settings({**base_env, "BMCP_QUERY_MEMORY_MB": bad})

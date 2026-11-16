@@ -33,11 +33,12 @@ from __future__ import annotations
 
 import datetime as _dt
 import difflib
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
 from . import model as m
-from .rawsql import SqlCheckError, check_expression, check_query, ensure_parses
+from .rawsql import SqlCheckError, case_null_warnings, check_expression, check_query, ensure_parses
 
 NUMERIC = ("BIGINT", "INTEGER", "DOUBLE")
 
@@ -94,6 +95,7 @@ class _Ctx:
 
     def __init__(self, where: str):
         self.where, self.problems = where, []
+        self.changed: dict[str, str] = {}      # set by _step: column → the expression giving its new value
 
     def fail(self, msg: str) -> None:
         self.problems.append(f"{self.where}: {msg}")
@@ -139,9 +141,24 @@ def _typed_lit(value, sql_type: str) -> str:
     return lit(value)
 
 
+def _not_assets(names: list[str], known, planned: set[str], as_list: bool = False) -> str:
+    """Unknown asset names, each with its likeliest meaning BEFORE the (long) known list: a
+    live client's view of the message was cut inside that list, so the hint never showed.
+    `planned` are outputs of this plan defined later, which an earlier output cannot use."""
+    hints = []
+    for name in names:
+        near = difflib.get_close_matches(name, sorted(set(known) | planned), n=1, cutoff=0.6)
+        if near and near[0] in known:
+            hints.append(f"did you mean {near[0]!r} for {name!r}?")
+        elif near:
+            hints.append(f"{near[0]!r} (for {name!r}?) is defined later in outputs; list it before this output")
+    what = f"{names} are not assets" if as_list else f"{names[0]!r} is not an asset"
+    return f"{what} of this plan{' — ' + ' '.join(hints) if hints else ''} (known: {sorted(known)})"
+
+
 # ─── conditions ────────────────────────────────────────────────────────────────
 
-_OPS = {"eq": "=", "ne": "<>", "gt": ">", "ge": ">=", "lt": "<", "le": "<="}
+_OPS = {"eq": "=", "gt": ">", "ge": ">=", "lt": "<", "le": "<="}
 
 
 def _condition(cond, schema: Schema, ctx: _Ctx) -> Optional[str]:
@@ -169,9 +186,15 @@ def _condition(cond, schema: Schema, ctx: _Ctx) -> Optional[str]:
     if bad:
         ctx.fail(f"value(s) {bad} do not fit column {col!r} ({ctype})")
         return None
+    # ne / not_in keep missing values: "not cancelled" must not also drop rows whose
+    # status is unknown (plain SQL <> and NOT IN do — a live run lost 12 of 60 rows)
     if cond.operator in ("in", "not_in"):
         inner = ", ".join(_typed_lit(v, ctype) for v in values)
-        return f"{q(col)} {'IN' if cond.operator == 'in' else 'NOT IN'} ({inner})"
+        if cond.operator == "in":
+            return f"{q(col)} IN ({inner})"
+        return f"({q(col)} NOT IN ({inner}) OR {q(col)} IS NULL)"
+    if cond.operator == "ne":
+        return f"{q(col)} IS DISTINCT FROM {_typed_lit(cond.value, ctype)}"
     return f"{q(col)} {_OPS[cond.operator]} {_typed_lit(cond.value, ctype)}"
 
 
@@ -258,14 +281,26 @@ def _step(step, schema: Schema, ctx: _Ctx, warnings: list) -> Optional[tuple[Sch
                                         f"{[k.upper() if case == 'upper' else k.lower() for k in dead]}")
 
     elif isinstance(step, m.Cast):
+        to_integer = []
         for name, typ in step.columns.items():
             col = need(name)
             if col is None:
                 continue
-            exprs[col] = f"TRY_CAST({q(col)} AS {typ}) AS {q(col)}"
+            if typ in ("INTEGER", "BIGINT") and schema.cols[col] in ("VARCHAR", "DOUBLE"):
+                # TRY_CAST rounds ('3.5' → 4, '-2.5' → -3); a value with a fraction becomes
+                # NULL instead, a whole one ('3.0', '1e3') converts. (Past 2^53 a DOUBLE holds
+                # no fraction, so none can be seen there.)
+                as_double = f"TRY_CAST({q(col)} AS DOUBLE)"
+                exprs[col] = (f"CASE WHEN {as_double} = floor({as_double}) THEN TRY_CAST({q(col)} AS {typ}) END "
+                              f"AS {q(col)}")
+                to_integer.append(col)
+            else:
+                exprs[col] = f"TRY_CAST({q(col)} AS {typ}) AS {q(col)}"
             out.cols[col] = typ
         if not ctx.problems:
-            warnings.append(f"{ctx.where}: cast uses TRY_CAST — values that do not convert become NULL; "
+            fraction = (f"; for {to_integer} (to a whole-number type) that includes numbers with a fraction "
+                        f"like 3.5, which are not rounded — cast to DOUBLE to keep them") if to_integer else ""
+            warnings.append(f"{ctx.where}: cast uses TRY_CAST — values that do not convert become NULL{fraction}; "
                             f"add a not_null check if that must not happen")
 
     elif isinstance(step, m.ParseDate):
@@ -306,6 +341,8 @@ def _step(step, schema: Schema, ctx: _Ctx, warnings: list) -> Optional[tuple[Sch
         elif typ == "UNKNOWN":
             ctx.fail(f"derive {step.name!r}: the type of the expression cannot be determined; give 'type'")
             return None
+        for warning in case_null_warnings(step.expression):
+            warnings.append(f"{ctx.where}: derive {step.name!r}: {warning}")
         exprs[step.name] = f"{expr} AS {q(step.name)}"
         out.cols[step.name] = typ
 
@@ -328,6 +365,9 @@ def _step(step, schema: Schema, ctx: _Ctx, warnings: list) -> Optional[tuple[Sch
 
     if ctx.problems:
         return None
+    # columns this step rewrites in place (not new ones): changes.py counts what each did
+    ctx.changed = {c: exprs[c][:-len(f" AS {q(c)}")] for c in schema.cols
+                   if c in out.cols and exprs[c] != q(c) and exprs[c].endswith(f" AS {q(c)}")}
     select = ", ".join(exprs[c] for c in out.cols)
     return out, f"SELECT {'DISTINCT ' if distinct else ''}{select} FROM {{prev}}{where}{qualify}"
 
@@ -369,6 +409,7 @@ class Asset:
     depends: list[str]
     columns: list[dict]          # [{"name", "type", "checks": [...]}]
     trace: list[dict] = field(default_factory=list)   # clean only: schema after each step
+    origins: dict = field(default_factory=dict)       # clean only: column → the raw column it came from (None: new)
 
     def header(self) -> str:
         """The Bruin asset header (YAML inside the @bruin comment)."""
@@ -395,15 +436,72 @@ class Compiled:
     assets: list[Asset]
     warnings: list[str]
     exports: list[dict]
+    # per cleaned table, a query that checks replace_values keys against the data (run by validate)
+    mapping_probes: list[dict] = field(default_factory=list)
 
     def summary(self) -> dict:
         return {
             "assets": {a.name: {"kind": a.kind, "depends": a.depends, "columns": a.columns,
-                                "sql": a.body, **({"steps": a.trace} if a.trace else {})}
+                                "sql": a.body, **({"steps": a.trace} if a.trace else {}),
+                                **({"origins": a.origins} if a.kind == "clean" else {})}
                        for a in self.assets},
             "warnings": self.warnings,
             "exports": self.exports,
         }
+
+
+def _mapping_probe(table: str, path: str, ctes: list[str], mapped: list) -> dict:
+    """One query: for each replace_values key, does any value equal it AT THAT STEP?
+    And which values does the column hold there (if it holds at most LEFTOVER_MAX)?
+
+    It runs the plan's own CTE chain up to the step before each mapping, over the
+    real data, so earlier trims / case changes count exactly as they will in the
+    run. A live run mapped 'disloyal customer' where the data said 'disloyal
+    Customer': validation passed, the run "replaced" nothing, and the summary
+    said it had. Another mapped 'Undergraduate' and left 'undergrad' behind.
+    Returns rows (kind, step, column, text, n, near): kind 'key' — text a key,
+    n its hits, near a value equal to it ignoring case and surrounding spaces;
+    kind 'value' — text a value of the column, n its rows.
+    """
+    last = max(i for i, *_ in mapped)
+    chain = [f"s0 AS MATERIALIZED (SELECT * FROM read_csv({lit(path)}, header = true, all_varchar = true))",
+             *ctes[1:last]]
+    parts = []
+    for i, _, col, mapping in mapped:
+        values = ", ".join(f"({lit(k)})" for k in mapping)
+        parts.append(
+            f"SELECT 'key' AS kind, {i} AS step, {lit(col)} AS col, k.mkey AS text, "
+            f"count(*) FILTER (WHERE v.c = k.mkey) AS n, "
+            f"min(v.c) FILTER (WHERE lower(trim(v.c)) = lower(trim(k.mkey))) AS near "
+            f"FROM (VALUES {values}) k(mkey) CROSS JOIN (SELECT DISTINCT {q(col)} AS c FROM s{i - 1}) v "
+            f"GROUP BY k.mkey")
+        parts.append(
+            f"SELECT 'value', {i}, {lit(col)}, c, n, NULL FROM (SELECT {q(col)} AS c, count(*) AS n FROM s{i - 1} "
+            f"WHERE {q(col)} IS NOT NULL GROUP BY 1 QUALIFY count(*) OVER () <= {LEFTOVER_MAX})")
+    sql = "WITH\n" + ",\n".join(chain) + "\n" + "\nUNION ALL\n".join(parts) + "\nORDER BY kind, step, col, text"
+    ensure_parses(sql)
+    return {"table": table, "path": path, "sql": sql, "steps": {i: where for i, where, *_ in mapped},
+            "mappings": {(i, col): mapping for i, _, col, mapping in mapped}}
+
+
+LEFTOVER_MAX = 200          # a column with more distinct values is not a category list; not checked
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"[^0-9a-z]", "", text.lower())
+
+
+def looks_like(value: str, other: str) -> bool:
+    """
+    'undergrad' ~ 'Undergraduate', 'Bachelors' ~ "bachelor's", 'Mastres' ~ 'Masters'.
+    Spelling slips keep the first letter; 'Loyal' ~ 'disloyal' (live: 0.90 alike) is the opposite.
+    """
+    a, b = _norm(value), _norm(other)
+    if not a or not b:
+        return False
+    short, long = sorted((a, b), key=len)
+    return a == b or (len(short) >= 4 and long.startswith(short)) or \
+        (a[0] == b[0] and difflib.SequenceMatcher(None, a, b).ratio() >= 0.85)
 
 
 def _columns(schema: Schema, checks: dict) -> list[dict]:
@@ -421,8 +519,16 @@ def compile_plan(plan: m.Plan, source_paths: dict[str, str],
     problems, warnings = [], []
     schemas: dict[str, Schema] = {}
     assets: list[Asset] = []
+    probes: list[dict] = []
+    # assets already attempted: one of them missing from `schemas` failed above, which
+    # an output using it must say (live: "not an asset of this plan" read like a typo)
+    attempted: set[str] = set()
+
+    def unbuilt(name: str) -> bool:
+        return name in attempted and name not in schemas
 
     for src in plan.sources:
+        attempted.add(f"raw.{src.table}")
         names = source_schemas.get(src.table)
         if not names:
             problems.append(f"source {src.table!r}: no schema (the dataset could not be read)")
@@ -436,20 +542,31 @@ def compile_plan(plan: m.Plan, source_paths: dict[str, str],
 
     for table in plan.clean:
         ctx = _Ctx(f"clean.{table.table}")
+        attempted.add(ctx.where)
         schema = schemas.get(f"raw.{table.table}")
         if schema is None:
             problems.append(f"{ctx.where}: its source could not be read")
             continue
         ctes = [f"s0 AS MATERIALIZED (SELECT * FROM raw.{table.table})"]
         trace = [{"step": 0, "op": "source", "columns": schema.as_list()}]
+        mapped = []                                     # (step, where, column at that step, mapping)
+        origins = {c: c for c in schema.cols}
         for i, step in enumerate(table.steps, 1):
             ctx.where = f"clean.{table.table} step {i} ({step.op})"
+            renamed = {schema.find(o): n for o, n in step.mapping.items()} if isinstance(step, m.Rename) else {}
+            ctx.changed = {}
+            if isinstance(step, m.ReplaceValues):
+                mapped += [(i, ctx.where, col, dict(step.mapping)) for col in map(schema.find, step.columns)
+                           if col is not None and schema.cols[col] == "VARCHAR"]
             result = _step(step, schema, ctx, warnings)
             if result is None:
                 break
+            back = {new: old for old, new in renamed.items()}
+            origins = {c: origins.get(back.get(c, c)) for c in result[0].cols}
             schema, body = result
             ctes.append(f"s{i} AS MATERIALIZED ({body.format(prev=f's{i - 1}')})")
-            trace.append({"step": i, "op": step.op, "columns": schema.as_list()})
+            trace.append({"step": i, "op": step.op, "columns": schema.as_list(),
+                          **({"changed": ctx.changed} if ctx.changed else {})})
         if ctx.problems:
             problems.extend(ctx.problems)
             continue
@@ -469,14 +586,24 @@ def compile_plan(plan: m.Plan, source_paths: dict[str, str],
         name = f"clean.{table.table}"
         schemas[name] = schema
         assets.append(Asset(name=name, kind="clean", body=body, depends=[f"raw.{table.table}"],
-                            columns=_columns(schema, checks), trace=trace))
+                            columns=_columns(schema, checks), trace=trace, origins=origins))
+        if mapped:
+            probes.append(_mapping_probe(table.table, source_paths[table.table], ctes, mapped))
 
+    planned = {f"mart.{o.name}_{part}" for o in plan.outputs if isinstance(o, m.Split) for part in o.parts} | \
+              {f"mart.{o.name}" for o in plan.outputs if not isinstance(o, m.Split)}
     for output in plan.outputs:
         ctx = _Ctx(f"mart.{output.name}")
+        attempted.add(ctx.where)
         if isinstance(output, m.RawSql):
             missing = [s for s in output.sources if s not in schemas]
+            failed = [s for s in missing if unbuilt(s)]
+            unknown = [s for s in missing if s not in failed]
+            if failed:
+                ctx.fail(f"sources {failed} were not built because of the problem(s) reported above for them")
+            if unknown:
+                ctx.fail("sources " + _not_assets(unknown, schemas, planned - {ctx.where}, as_list=True))
             if missing:
-                ctx.fail(f"sources {missing} are not assets of this plan (known: {sorted(schemas)})")
                 problems.extend(ctx.problems)
                 continue
             try:
@@ -484,6 +611,7 @@ def compile_plan(plan: m.Plan, source_paths: dict[str, str],
             except SqlCheckError as e:
                 problems.append(f"{ctx.where}: {e}")
                 continue
+            warnings.extend(f"{ctx.where}: {w}" for w in case_null_warnings(output.query))
             unknown = [c for c, t in cols if t == "UNKNOWN"]
             if unknown:
                 warnings.append(f"{ctx.where}: types of {unknown} could not be determined; "
@@ -501,7 +629,10 @@ def compile_plan(plan: m.Plan, source_paths: dict[str, str],
 
         source = schemas.get(output.source)
         if source is None:
-            ctx.fail(f"source {output.source!r} is not an asset of this plan (known: {sorted(schemas)})")
+            if unbuilt(output.source):
+                ctx.fail(f"source {output.source!r} was not built because of the problem(s) reported above for it")
+            else:
+                ctx.fail("source " + _not_assets([output.source], schemas, planned - {ctx.where}))
             problems.extend(ctx.problems)
             continue
 
@@ -581,10 +712,10 @@ def compile_plan(plan: m.Plan, source_paths: dict[str, str],
     known = {a.name for a in assets}
     for export in plan.exports:
         if export.asset not in known:
-            problems.append(f"export {export.asset!r}: not an asset of this plan (known: {sorted(known)})")
+            problems.append("export " + _not_assets([export.asset], known, set()))
         else:
             exports.append({"asset": export.asset, "format": export.format})
 
     if problems:
         raise PlanError(problems)
-    return Compiled(assets=assets, warnings=warnings, exports=exports)
+    return Compiled(assets=assets, warnings=warnings, exports=exports, mapping_probes=probes)

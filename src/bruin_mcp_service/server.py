@@ -48,7 +48,7 @@ from .plan import exports as plan_exports
 from .plan import pipeline as plans
 from .plan import runs as plan_runs
 from .plan.engine import PlanError
-from .plan.model import parse_plan, parse_table_plan, plan_format, step_fields
+from .plan.model import json_argument, parse_plan, parse_table_plan, plan_format, step_fields
 from .plan.schema import plan_tool_schema, table_plan_tool_schema
 from .plan.saved import SavedPlanError, instantiate, list_saved
 from .logging_setup import configure_logging
@@ -211,7 +211,8 @@ def build_server(settings: Settings, store: TokenStore) -> FastMCP:
 
         filename is a label, but its extension (.csv or .xlsx) sets the file type.
         For .xlsx the first sheet is used unless sheet is given; it is converted
-        to CSV on the server."""
+        to CSV on the server. Files wider than the service's column limit
+        (1,000 by default) are refused: upload only the columns you need."""
         return datasets.upload(settings, caller.user_id, filename, content_base64, sheet)
 
     @secured("list_datasets")
@@ -226,36 +227,43 @@ def build_server(settings: Settings, store: TokenStore) -> FastMCP:
         return inspect(settings, datasets.get(settings, caller.user_id, dataset_id), sample_rows)
 
     @secured("validate_table_plan", schema=table_plan_tool_schema())
-    def validate_table_plan(caller: Caller, dataset_id: str, steps: list | None = None, table: str = "data",
-                            name: str | None = None, description: str = "", checks: list | None = None,
-                            expect_columns: list | None = None, outputs: list | None = None,
-                            exports: list | None = None) -> dict[str, Any]:
+    def validate_table_plan(caller: Caller, dataset_id: str, steps: list | str | None = None,
+                            table: str = "data", name: str | None = None, description: str = "",
+                            checks: list | str | None = None, expect_columns: list | str | None = None,
+                            outputs: list | str | None = None,
+                            exports: list | str | None = None) -> dict[str, Any]:
         """Prepare ONE uploaded dataset: give its cleaning steps (in order), checks, and optional outputs
         as arguments. Checked against the dataset's REAL columns; nothing is built. Returns a draft_id,
-        steps_received (one line per step — check it has everything the user asked for), the columns
-        after every step and the SQL, or every problem found. Then call compile_plan(draft_id).
+        warnings, steps_received (one line per step — check it has everything the user asked for) and
+        each asset's final columns, or every problem found. Then call compile_plan(draft_id).
         Every source column starts as VARCHAR; change types with cast / parse_date."""
+        # str only so a malformed JSON string reaches json_argument's error, not pydantic's
+        steps, checks, expect_columns, outputs, exports = (
+            json_argument(n, v) for n, v in (("steps", steps), ("checks", checks), ("expect_columns", expect_columns),
+                                             ("outputs", outputs), ("exports", exports)))
         args = {"dataset_id": dataset_id, "table": table, "description": description,
                 "steps": steps or [], "checks": checks or [], "outputs": outputs or [], "exports": exports or []}
         if name is not None:
             args["name"] = name
         if expect_columns is not None:
             args["expect_columns"] = expect_columns
-        return plans.validate(settings, caller.user_id, parse_table_plan(args))
+        return plans.validate_reply(plans.validate(settings, caller.user_id, parse_table_plan(args)))
 
     @secured("validate_plan", schema=plan_tool_schema())
     def validate_plan(caller: Caller, plan: dict[str, Any] | str) -> dict[str, Any]:
         """Prepare SEVERAL tables in one plan (for one table, validate_table_plan is simpler). Checked
-        against the REAL columns of your datasets; nothing is built. Returns a draft_id, steps_received,
-        per-step columns and SQL, or every problem found. Then call compile_plan(draft_id)."""
-        return plans.validate(settings, caller.user_id, parse_plan(plan))
+        against the REAL columns of your datasets; nothing is built. Returns a draft_id, warnings,
+        steps_received and each asset's final columns, or every problem found. Then call compile_plan(draft_id)."""
+        return plans.validate_reply(plans.validate(settings, caller.user_id, parse_plan(plan)))
 
     @secured("compile_plan")
     def compile_plan(caller: Caller, draft_id: str) -> dict[str, Any]:
         """Build the plan validated as draft_id into a Bruin pipeline (one cleaning asset per table, a
         chain of CTEs), checked by `bruin validate`. Re-checks it against the data first. Returns
-        pipeline_id, steps_received and every asset's SQL as Bruin will run it. Nothing is executed."""
-        return plans.build(settings, caller.user_id, plans.load_draft(settings, caller.user_id, draft_id))
+        pipeline_id, warnings, steps_received and each asset's final columns; get_pipeline shows the SQL
+        as Bruin will run it. Nothing is executed."""
+        return plans.compile_reply(plans.build(settings, caller.user_id,
+                                               plans.load_draft(settings, caller.user_id, draft_id)))
 
     @secured("list_pipelines")
     def list_pipelines(caller: Caller) -> dict[str, Any]:
@@ -264,8 +272,9 @@ def build_server(settings: Settings, store: TokenStore) -> FastMCP:
 
     @secured("get_pipeline")
     def get_pipeline(caller: Caller, pipeline_id: str) -> dict[str, Any]:
-        """A compiled pipeline: its assets, their SQL, per-step schemas and warnings."""
-        return plans.get(settings, caller.user_id, pipeline_id)
+        """A compiled pipeline in full: its assets, their SQL as Bruin runs it, the columns after every
+        step, and warnings. Only needed to debug or show the SQL; compile_plan's reply has the summary."""
+        return plans.public(settings, plans.get(settings, caller.user_id, pipeline_id))
 
     @secured("delete_pipeline")
     def delete_pipeline(caller: Caller, pipeline_id: str) -> dict[str, Any]:
@@ -300,8 +309,11 @@ def build_server(settings: Settings, store: TokenStore) -> FastMCP:
     @secured("get_run")
     def get_run(caller: Caller, pipeline_id: str, run_id: str) -> dict[str, Any]:
         """Status of a run: running / succeeded / failed / timeout / refused / interrupted, with each
-        asset's PASS/FAIL, check results, errors, and the rows/columns of every table built. While
-        the run is going it waits up to 30 s for it to finish before answering."""
+        asset's PASS/FAIL, check results, errors, and the rows/columns of every table built. Once
+        succeeded, `changes` says exactly what the run changed in each cleaned table (rows removed
+        by which step, renamed/dropped/added/retyped columns, values that appeared or vanished):
+        report those facts when telling the user what changed. While the run is going it waits up
+        to 30 s for it to finish before answering."""
         return plan_runs.get(settings, caller.user_id, pipeline_id, run_id)
 
     @secured("export_asset")

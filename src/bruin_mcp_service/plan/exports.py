@@ -26,7 +26,7 @@ import secrets
 import time
 from pathlib import Path
 
-from ..config import Settings
+from ..config import Settings, duckdb_limits
 from ..paths import resolve_user_path, user_root
 from . import pipeline as plans
 from . import runs
@@ -89,7 +89,7 @@ def export(settings: Settings, user_id: str, pipeline_id: str, asset: str, fmt: 
     staging = out_dir / f".staging-{export_id}.{fmt}"
     schema, _, table = asset.partition(".")
     con = duckdb.connect(str(pipeline_root / "warehouse.duckdb"), read_only=True,
-                         config={"enable_external_access": False})
+                         config={"enable_external_access": False, **duckdb_limits(settings)})
     rows = 0
     try:
         cur = con.execute(f'SELECT * FROM "{schema}"."{table}"')

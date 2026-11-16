@@ -1,7 +1,7 @@
 """
 Run a command confined by Linux Landlock: an allow-list of folders and no TCP.
 
-    python -I sandbox.py --ro DIR … --rw DIR … --rofile FILE … --rwfile FILE … -- CMD ARGS…
+    python -I sandbox.py --ro DIR … --rw DIR … --rofile FILE … --rwfile FILE … [--data-mb N] -- CMD ARGS…
 
 The launcher restricts ITSELF (landlock_restrict_self after PR_SET_NO_NEW_PRIVS)
 and then execs CMD, which inherits the restriction and cannot lift it. It is
@@ -17,10 +17,18 @@ file, and on an outbound TCP connect.
 
 If Landlock is unavailable the launcher exits 97 WITHOUT running the command:
 callers must treat that as "cannot run safely", never fall back to unconfined.
+
+--data-mb caps CMD's memory (RLIMIT_DATA, inherited by CMD and unliftable
+above the hard limit). Bruin offers no way to set DuckDB's own memory_limit
+for a run (connection `config`/`settings` keys and SET in an asset were tried
+2026-11-01; each asset gets a fresh DuckDB at 80% of RAM), so this is what
+stops a run: unlimited, one count(DISTINCT) asset used 26 GB of 31; at
+--data-mb 4096 it failed in 28 s with "Out of Memory Error: Allocation failure".
 """
 
 import ctypes
 import os
+import resource
 import sys
 
 SYS_CREATE, SYS_ADD, SYS_RESTRICT = 444, 445, 446      # x86_64 syscall numbers
@@ -104,17 +112,20 @@ def restrict(ro: list, rw: list, ro_files: list, rw_files: list) -> None:
     os.close(fd)
 
 
-def command(launcher_python: str, cmd: list, ro=(), rw=(), ro_files=(), rw_files=()) -> list:
+def command(launcher_python: str, cmd: list, ro=(), rw=(), ro_files=(), rw_files=(),
+            data_mb: int | None = None) -> list:
     """argv that runs `cmd` under this launcher."""
     argv = [launcher_python, "-I", os.path.abspath(__file__)]
     for flag, paths in (("--ro", ro), ("--rw", rw), ("--rofile", ro_files), ("--rwfile", rw_files)):
         for p in paths:
             argv += [flag, str(p)]
+    if data_mb is not None:
+        argv += ["--data-mb", str(int(data_mb))]
     return argv + ["--", *map(str, cmd)]
 
 
 def main(argv: list) -> int:
-    lists = {"--ro": [], "--rw": [], "--rofile": [], "--rwfile": []}
+    lists = {"--ro": [], "--rw": [], "--rofile": [], "--rwfile": [], "--data-mb": []}
     i = 0
     while i < len(argv) and argv[i] != "--":
         flag = argv[i]
@@ -123,6 +134,17 @@ def main(argv: list) -> int:
             return 2
         lists[flag].append(argv[i + 1])
         i += 2
+    data_mb = lists.pop("--data-mb")
+    if data_mb:
+        try:
+            limit = int(data_mb[-1]) * 1024 * 1024
+            if limit <= 0:
+                raise ValueError
+            resource.setrlimit(resource.RLIMIT_DATA, (limit, limit))
+        except (ValueError, OSError) as exc:
+            print(f"sandbox: cannot set the memory limit {data_mb[-1]!r} MB, refusing to run: {exc}",
+                  file=sys.stderr)
+            return 2
     cmd = argv[i + 1:]
     if not cmd:
         print("sandbox: no command", file=sys.stderr)

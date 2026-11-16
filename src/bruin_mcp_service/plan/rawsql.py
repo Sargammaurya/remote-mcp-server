@@ -154,6 +154,54 @@ def _check_text_maths(typed: exp.Expression) -> None:
                     f"column, or TRY_CAST({_shown(operand)} AS DOUBLE)")
 
 
+def _null_tested(node: exp.Expression, case: exp.Case) -> bool:
+    """Inside an `x IS NULL` test (not IS NOT NULL) or a COALESCE / IFNULL within this CASE."""
+    parent = node.parent
+    while parent is not None and parent is not case:
+        if isinstance(parent, exp.Coalesce):
+            return True
+        if isinstance(parent, exp.Is) and isinstance(parent.expression, exp.Null) \
+                and not isinstance(parent.parent, exp.Not):
+            return True
+        parent = parent.parent
+    return False
+
+
+def case_null_warnings(sql: str) -> list[str]:
+    """CASEs whose ELSE also catches rows where a tested column is NULL.
+
+    CASE WHEN Age < 25 THEN 'Gen Z' … ELSE 'Boomer+' END sends a missing Age to
+    'Boomer+': NULL < 25 is not true, so no WHEN matches (DuckDB 1.5.2, checked
+    2026-10-30). A live run labelled 23 people with no age 'Boomer+' and 10 with
+    no income 'Very High' this way. A warning, not an error: an ELSE meant to
+    collect the missing ('Other') is legitimate.
+    """
+    try:
+        tree = sqlglot.parse_one(sql if sql.lstrip().upper().startswith(("SELECT", "WITH"))
+                                 else f"SELECT ({sql})", read=DIALECT)
+    except ParseError:
+        return []
+    out = []
+    for case in tree.find_all(exp.Case):
+        default = case.args.get("default")
+        if default is None or isinstance(default.unnest(), exp.Null):
+            continue
+        tested = [case.this] if case.this is not None else []
+        tested += [branch.this for branch in case.args.get("ifs") or []]
+        handled = {col.name.lower() for t in tested for col in t.find_all(exp.Column) if _null_tested(col, case)}
+        exposed = []
+        for t in tested:
+            for col in t.find_all(exp.Column):
+                if not _null_tested(col, case) and col.name.lower() not in handled and col.name not in exposed:
+                    exposed.append(col.name)
+        if exposed:
+            first = exp.column(exp.to_identifier(exposed[0])).sql(DIALECT)
+            out.append(f"rows where {', '.join(exposed)} is NULL (missing) match no WHEN and get the ELSE "
+                       f"value {default.sql(DIALECT)[:40]}; if missing should stay missing, start the CASE "
+                       f"with WHEN {first} IS NULL THEN NULL")
+    return out
+
+
 def _schema_mapping(schemas: dict[str, dict[str, str]]) -> dict:
     """{'clean.orders': {...}} → sqlglot's nested {'clean': {'orders': {...}}}."""
     mapping: dict = {}

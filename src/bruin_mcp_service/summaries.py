@@ -31,7 +31,7 @@ _SENSITIVE_NAME = re.compile(
     r"national.?id|aadhaar|pan\b|tax.?id|iban|account|card|cvv|password|secret|token|\bdob\b|"
     r"birth|salary|\bip\b|ip_address|first.?name|last.?name|full.?name|surname|(?<![a-z])name(?![a-z])|"
     # people: masked unless the name says it is a category of them
-    r"(?:customer|client|patient|employee|person|contact)(?!_?(?:type|segment|tier|group|category|"
+    r"(?:customer|client|patient|employee|person|contact)(?![ _-]?(?:type|segment|tier|group|category|"
     r"class|status|plan|region|country|count|id)))")
 _EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[a-z]{2,}", re.I)
 # a run of digits with phone/card separators, anywhere in the text

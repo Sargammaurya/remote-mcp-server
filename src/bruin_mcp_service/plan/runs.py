@@ -36,8 +36,9 @@ from pathlib import Path
 
 from .. import datasets, sandbox
 from ..bruin_cli import bruin_env, verify_pinned_binary
-from ..config import Settings
+from ..config import Settings, duckdb_limits
 from ..paths import resolve_user_path
+from . import changes
 from . import pipeline as plans
 
 _RUN_ID = re.compile(r"run_[0-9a-f]{16}")
@@ -119,14 +120,15 @@ def parse_output(text: str) -> dict:
     return {"assets": assets, "checks": checks, "errors": errors[:20]}
 
 
-def table_stats(root: Path, asset_names: list[str]) -> dict:
+def table_stats(settings: Settings, root: Path, asset_names: list[str]) -> dict:
     """Rows and columns of each built table, read without file access."""
     import duckdb
     db = root / "warehouse.duckdb"
     if not db.exists():
         return {}
     out = {}
-    con = duckdb.connect(str(db), read_only=True, config={"enable_external_access": False})
+    con = duckdb.connect(str(db), read_only=True,
+                         config={"enable_external_access": False, **duckdb_limits(settings)})
     try:
         for name in asset_names:
             schema, _, table = name.partition(".")
@@ -142,6 +144,17 @@ def table_stats(root: Path, asset_names: list[str]) -> dict:
     finally:
         con.close()
     return out
+
+
+def run_changes(settings: Settings, root: Path, record: dict) -> dict:
+    """What the run changed in each cleaned table (changes.py), read like table_stats."""
+    import duckdb
+    con = duckdb.connect(str(root / "warehouse.duckdb"), read_only=True,
+                         config={"enable_external_access": False, **duckdb_limits(settings)})
+    try:
+        return changes.describe(con, record)
+    finally:
+        con.close()
 
 
 def _scrub(text: str, settings: Settings) -> str:
@@ -185,7 +198,8 @@ def start(settings: Settings, user_id: str, pipeline_id: str) -> dict:
                 sys.executable,
                 [str(settings.bruin_bin), "run", "--config-file", str(root / ".bruin.yml"),
                  "--no-color", "--no-timestamp", str(root / "pipeline")],
-                ro=[settings.bruin_bin.parent, settings.bruin_home, *dataset_dirs], rw=[root])
+                ro=[settings.bruin_bin.parent, settings.bruin_home, *dataset_dirs], rw=[root],
+                data_mb=settings.run_memory_mb)
             try:
                 proc = subprocess.run(cmd, cwd=root, env=bruin_env(settings), capture_output=True,
                                       text=True, timeout=settings.run_timeout_s)
@@ -201,9 +215,17 @@ def start(settings: Settings, user_id: str, pipeline_id: str) -> dict:
                        assets=parsed["assets"], checks=parsed["checks"],
                        errors=[_scrub(e, settings) for e in parsed["errors"]],
                        log_tail=_scrub(output[-LOG_TAIL:], settings),
-                       tables=table_stats(root, sorted(record["assets"])) if status in ("succeeded", "failed") else {})
+                       tables=table_stats(settings, root, sorted(record["assets"])) if status in ("succeeded", "failed") else {})
+            if status == "succeeded":
+                try:
+                    run["changes"] = run_changes(settings, root, record)
+                except Exception as exc:  # noqa: BLE001 — the report never changes the run's outcome
+                    run["changes"] = {"error": f"changes could not be computed: {type(exc).__name__}"}
             if status == "timeout":
                 run["errors"] = [f"the run exceeded {settings.run_timeout_s}s and was stopped"]
+            elif status == "failed" and "Out of Memory" in output:
+                run["errors"].insert(0, f"the run needed more than the service's {settings.run_memory_mb} MB "
+                                        f"per run (BMCP_RUN_MEMORY_MB); simplify the plan or use less data")
         except Exception as exc:  # noqa: BLE001 — a run must always end with a recorded status
             run.update(status="error", finished_at=int(time.time()), errors=[f"{type(exc).__name__}: {exc}"])
         finally:

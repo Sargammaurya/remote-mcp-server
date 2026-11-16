@@ -60,7 +60,7 @@ def test_personal_values_are_masked_even_in_an_innocent_column(value):
     assert "values" not in out and "look like personal data" in out["values_hidden"]
 
 
-@pytest.mark.parametrize("column", ["customer_segment", "client_type", "country", "plan", "status"])
+@pytest.mark.parametrize("column", ["customer_segment", "client_type", "Customer Type", "customer-tier", "CustomerType", "country", "plan", "status"])
 def test_categories_are_not_masked(column):
     assert "values" in summaries.summarize(column, 1, [("a", 1)])
 

@@ -21,6 +21,7 @@ import base64
 import binascii
 import csv
 import hashlib
+import io
 import json
 import os
 import re
@@ -37,6 +38,8 @@ from .paths import resolve_user_path, user_root
 
 _DATASET_ID = re.compile(r"ds_[0-9a-f]{16}")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+# the header row is read from this much of a CSV (quoted newlines included)
+HEADER_SCAN_CHARS = 4 * 1024 * 1024
 # uncompressed-size cap for .xlsx (a zip); guards against decompression bombs
 XLSX_MAX_UNCOMPRESSED_FACTOR = 20
 
@@ -98,7 +101,24 @@ def _decode(content_base64: str, max_bytes: int) -> bytes:
     return data
 
 
-def _check_csv(data: bytes) -> None:
+def _too_many_columns(count: int, max_columns: int) -> DatasetError:
+    return DatasetError(f"the file has {count} columns; the service accepts at most {max_columns} "
+                        f"(BMCP_MAX_COLUMNS): keep only the columns you need and upload again")
+
+
+def _header_columns(text: str) -> int:
+    """Fields in the header row by the delimiter that gives the most: DuckDB sniffs the
+    delimiter later, so this is an upper bound whichever it picks."""
+    head, best = text[:HEADER_SCAN_CHARS], 0
+    for delimiter in (",", "\t", ";", "|"):
+        try:
+            best = max(best, len(next(csv.reader(io.StringIO(head), delimiter=delimiter), [])))
+        except csv.Error:                       # e.g. a field over csv's size limit: not this delimiter
+            continue
+    return best
+
+
+def _check_csv(data: bytes, max_columns: int) -> None:
     try:
         text = data.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
@@ -108,9 +128,12 @@ def _check_csv(data: bytes) -> None:
     first = text.splitlines()[0] if text.strip() else ""
     if not first.strip():
         raise DatasetError("CSV has no header row")
+    columns = _header_columns(text)
+    if columns > max_columns:
+        raise _too_many_columns(columns, max_columns)
 
 
-def _xlsx_to_csv(src: Path, dst: Path, sheet: str | None, max_bytes: int) -> str:
+def _xlsx_to_csv(src: Path, dst: Path, sheet: str | None, max_bytes: int, max_columns: int) -> str:
     try:
         with zipfile.ZipFile(src) as zf:
             total = sum(i.file_size for i in zf.infolist())
@@ -135,7 +158,10 @@ def _xlsx_to_csv(src: Path, dst: Path, sheet: str | None, max_bytes: int) -> str
         written = 0
         with open(dst, "w", newline="", encoding="utf-8") as fh:
             writer = csv.writer(fh)
-            for row in ws.iter_rows(values_only=True):
+            for n, row in enumerate(ws.iter_rows(values_only=True)):
+                # rows come padded to the sheet's widest column, and so many columns the CSV has
+                if n == 0 and len(row) > max_columns:
+                    raise _too_many_columns(len(row), max_columns)
                 writer.writerow(["" if v is None else v for v in row])
                 written = fh.tell()
                 if written > max_bytes:
@@ -185,10 +211,11 @@ def upload(settings: Settings, user_id: str, filename: str, content_base64: str,
             "uploaded_at": int(time.time()),
         }
         if ext == ".csv":
-            _check_csv(data)
+            _check_csv(data, settings.max_columns)
             shutil.copyfile(original, staging / "data.csv")
         else:
-            meta["sheet"] = _xlsx_to_csv(original, staging / "data.csv", sheet, settings.max_upload_bytes)
+            meta["sheet"] = _xlsx_to_csv(original, staging / "data.csv", sheet, settings.max_upload_bytes,
+                                         settings.max_columns)
         (staging / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
         _make_read_only(staging)
         os.rename(staging, root / dataset_id)

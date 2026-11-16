@@ -114,3 +114,26 @@ def test_other_users_dataset_looks_missing(settings):
 def test_malformed_dataset_ids(settings, bad):
     with pytest.raises(DatasetError, match="no dataset"):
         datasets.get(settings, "alice", bad)
+
+
+@pytest.mark.parametrize("delimiter", [",", "\t", ";", "|"])
+def test_uploads_wider_than_the_column_limit_are_refused(base_env, delimiter):
+    s = load_settings({**base_env, "BMCP_MAX_COLUMNS": "10"})
+    ok = delimiter.join(f"c{i}" for i in range(10)) + "\n" + delimiter.join("1" * 10) + "\n"
+    datasets.upload(s, "alice", "ten.csv", b64(ok))
+    wide = delimiter.join(f"c{i}" for i in range(11)) + "\n" + delimiter.join("1" * 11) + "\n"
+    with pytest.raises(DatasetError, match=r"has 11 columns; the service accepts at most 10 \(BMCP_MAX_COLUMNS\)"):
+        datasets.upload(s, "alice", "eleven.csv", b64(wide))
+
+
+def test_the_column_limit_counts_a_quoted_header_by_its_fields(base_env):
+    s = load_settings({**base_env, "BMCP_MAX_COLUMNS": "3"})
+    datasets.upload(s, "alice", "q.csv", b64('"a,b,c,d","line\nbreak",x\n1,2,3\n'))     # 3 fields, not 6
+
+
+def test_an_xlsx_wider_than_the_column_limit_is_refused(base_env):
+    s = load_settings({**base_env, "BMCP_MAX_COLUMNS": "3"})
+    datasets.upload(s, "alice", "ok.xlsx", b64(xlsx_bytes({"S": [["a", "b", "c"], [1, 2, 3]]})))
+    with pytest.raises(DatasetError, match="has 4 columns"):        # a stray cell widens every row
+        datasets.upload(s, "alice", "wide.xlsx", b64(xlsx_bytes({"S": [["a", "b", "c"], [1, 2, 3, "stray"]]})))
+    assert [m["filename"] for m in datasets.list_all(s, "alice")] == ["ok.xlsx"]

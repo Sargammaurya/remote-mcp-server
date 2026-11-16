@@ -15,12 +15,18 @@ allowed_directories, `..` paths, http(s) URLs and INSTALL are refused.
 allowed_directories still permits WRITES inside the folder (COPY TO, ATTACH),
 which is why dataset folders are made read-only on disk (datasets.py).
 
+The guard also caps the query's memory, threads and spill-to-disk (settings
+BMCP_QUERY_*). Over its memory DuckDB spills to the call's temp directory, and
+fails with "Out of Memory Error" rather than taking the machine — unguarded,
+profiling a 19 MB, 3,001-column file used 25 GB.
+
 Bruin exits 0 when a query fails and reports {"error": ...} in its JSON, so
 both are checked.
 """
 
 from __future__ import annotations
 
+import errno
 import json
 import shutil
 import subprocess
@@ -43,7 +49,7 @@ def sql_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
-def guard_prefix(allowed_dir: Path) -> str:
+def guard_prefix(allowed_dir: Path, settings: Settings) -> str:
     allowed = sql_string(str(allowed_dir).rstrip("/") + "/")
     return (
         "SELECT 1 AS bmcp_guard; "
@@ -51,6 +57,9 @@ def guard_prefix(allowed_dir: Path) -> str:
         "SET autoload_known_extensions=false; "
         f"SET allowed_directories=[{allowed}]; "
         "SET enable_external_access=false; "
+        f"SET memory_limit='{settings.query_memory_mb}MB'; "
+        f"SET threads={settings.query_threads}; "
+        f"SET max_temp_directory_size='{settings.query_spill_gb}GB'; "
         "SET lock_configuration=true; "
     )
 
@@ -78,18 +87,26 @@ def guarded_query(settings: Settings, allowed_dir: Path, statement: str,
             result = run_bruin(
                 settings,
                 ["query", "--config-file", str(config), "-c", "scratch", "-o", "json",
-                 "-q", guard_prefix(allowed_dir) + statement],
+                 "-q", guard_prefix(allowed_dir, settings) + statement],
                 cwd=work,
                 timeout=timeout or settings.tool_timeout_s,
             )
         except subprocess.TimeoutExpired:
             raise QueryError("query timed out") from None
+        except OSError as exc:
+            if exc.errno == errno.E2BIG:        # one argv string is capped at 128 KiB
+                raise QueryError("the query is too long to run (more than 128 KB of SQL)") from None
+            raise
         try:
             payload = json.loads(result.stdout)
         except json.JSONDecodeError:
             raise QueryError(f"Bruin returned no JSON (exit {result.returncode})") from None
         if result.returncode != 0 or "error" in payload:
-            raise QueryError(str(payload.get("error", f"bruin exited {result.returncode}")))
+            message = str(payload.get("error", f"bruin exited {result.returncode}"))
+            if "Out of Memory" in message:
+                message = (f"the query needed more than the service's {settings.query_memory_mb} MB "
+                           f"per query (BMCP_QUERY_MEMORY_MB): {message}")
+            raise QueryError(message)
         if "rows" not in payload:
             raise QueryError("Bruin returned no result rows")
         return payload

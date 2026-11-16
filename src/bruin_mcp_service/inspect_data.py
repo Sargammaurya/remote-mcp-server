@@ -9,6 +9,12 @@ is the client's (Swarn's) decision.
 Every statement is built here from the dataset's own column names (quoted as
 identifiers) and runs under bruin_query's guard with allowed_directories set
 to that one dataset's folder.
+
+Distinct counts come from ONE grouping over (column, value hash) pairs, which
+DuckDB can spill to disk, instead of one count(DISTINCT) per column: those
+cannot spill, and 401 of them ran out of the per-query memory limit. Statements
+are split into batches under MAX_STATEMENT, since each is one command-line
+argument to Bruin.
 """
 
 from __future__ import annotations
@@ -19,6 +25,20 @@ from . import summaries
 from .datasets import Dataset
 
 MAX_SAMPLE_ROWS = 50
+MAX_STATEMENT = 100_000         # characters; Linux caps a single argv string at 128 KiB
+
+
+def _batches(items: list, size) -> list[list]:
+    """Consecutive groups of `items` whose size(item) sums to at most MAX_STATEMENT."""
+    out, current, used = [], [], 0
+    for item in items:
+        n = size(item)
+        if current and used + n > MAX_STATEMENT:
+            out.append(current)
+            current, used = [], 0
+        current.append(item)
+        used += n
+    return out + [current] if current else out
 
 
 def _source(ds: Dataset) -> str:
@@ -34,30 +54,42 @@ def inspect(settings: Settings, ds: Dataset, sample_rows: int = 5) -> dict:
     described = guarded_query(settings, ds.dir, f"DESCRIBE SELECT * FROM {src}")
     columns = [{"name": r[0], "type": r[1]} for r in described["rows"]]
 
-    stats = ["count(*) AS row_count"]
+    # per column: nulls and exact distinct counts; with the first batch, the row
+    # count and exact-duplicate rows. hash() keeps one value column for UNPIVOT
+    # (one type, compact); NULL stays NULL so UNPIVOT drops it.
+    stats: dict[int, tuple[int, int]] = {}
+    fragments = [(i, f"if({sql_ident(c['name'])} IS NULL, NULL, hash({sql_ident(c['name'])})) AS \"{i}\"")
+                 for i, c in enumerate(columns)]
+    for n, batch in enumerate(_batches(fragments, lambda f: len(f[1]) + 2)):
+        head = ("(SELECT count(*) FROM t) AS row_count, "
+                "(SELECT count(*) FROM t) - (SELECT count(*) FROM (SELECT DISTINCT * FROM t)) AS duplicate_rows"
+                if n == 0 else "NULL AS row_count, NULL AS duplicate_rows")
+        got = guarded_query(
+            settings, ds.dir,
+            f"WITH t AS MATERIALIZED (SELECT * FROM {src}), "
+            f"h AS (SELECT {', '.join(f for _, f in batch)} FROM t), "
+            f"u AS (UNPIVOT h ON COLUMNS(*) INTO NAME c VALUE v), "
+            f"g AS (SELECT CAST(c AS INTEGER) AS c, count(*) AS d, sum(k) AS non_null "
+            f"FROM (SELECT c, v, count(*) AS k FROM u GROUP BY c, v) GROUP BY c) "
+            f"SELECT {head}, g.c, g.d, g.non_null FROM (SELECT 1) AS one LEFT JOIN g ON true",
+        )
+        for row_count, duplicate_rows, c_index, distinct, non_null in got["rows"]:
+            if n == 0:
+                total, duplicates = row_count, duplicate_rows
+            if c_index is not None:
+                stats[c_index] = (int(distinct), int(non_null))
     for i, col in enumerate(columns):
-        q = sql_ident(col["name"])
-        stats.append(f"count(*) - count({q}) AS n{i}")
-        stats.append(f"count(DISTINCT {q}) AS d{i}")
-    profile = guarded_query(
-        settings, ds.dir,
-        f"WITH t AS (SELECT * FROM {src}) SELECT {', '.join(stats)}, "
-        f"count(*) - (SELECT count(*) FROM (SELECT DISTINCT * FROM t)) AS duplicate_rows FROM t",
-    )
-    row = profile["rows"][0]
-    names = [c["name"] for c in profile["columns"]]
-    values = dict(zip(names, row))
-    for i, col in enumerate(columns):
-        col["null_count"] = values[f"n{i}"]
-        col["distinct_count"] = values[f"d{i}"]
+        distinct, non_null = stats.get(i, (0, 0))          # a column of only NULLs has no pairs
+        col["null_count"] = total - non_null
+        col["distinct_count"] = distinct
 
     # which values the text columns really hold (bounded and masked; see summaries.py)
     listable = [(i, c["name"]) for i, c in enumerate(columns)
                 if c["type"] == "VARCHAR" and c["distinct_count"] <= summaries.MAX_DISTINCT
                 and not summaries.is_sensitive_name(c["name"])]
     top: dict[int, list] = {}
-    if listable:
-        got = guarded_query(settings, ds.dir, summaries.top_values_sql(src, listable, sql_ident))
+    for batch in _batches(listable, lambda f: 4 * len(sql_ident(f[1])) + 120):   # name ×4 per part in top_values_sql
+        got = guarded_query(settings, ds.dir, summaries.top_values_sql(src, batch, sql_ident))
         for c_index, value, count in got["rows"]:
             top.setdefault(c_index, []).append((value, count))
     for i, col in enumerate(columns):
@@ -74,8 +106,8 @@ def inspect(settings: Settings, ds: Dataset, sample_rows: int = 5) -> dict:
         "filename": ds.meta["filename"],
         "kind": ds.meta["kind"],
         **({"sheet": ds.meta["sheet"]} if "sheet" in ds.meta else {}),
-        "row_count": values["row_count"],
-        "duplicate_rows": values["duplicate_rows"],
+        "row_count": total,
+        "duplicate_rows": duplicates,
         "columns": columns,
         "sample": sample,
         "engine": "bruin query (DuckDB), types detected by DuckDB's CSV sniffer",

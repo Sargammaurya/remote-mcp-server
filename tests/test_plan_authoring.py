@@ -150,10 +150,62 @@ def settings(real_env):
 
 
 @needs_bruin
+def test_mapping_keys_that_match_nothing_at_their_step_are_reported(settings, monkeypatch):
+    # live run: 'disloyal customer' was mapped where the data said 'disloyal Customer';
+    # it validated, ran, replaced nothing, and the summary said it had been replaced
+    ds = datasets.upload(settings, "alice", "synthetic_orders.csv", b64(MESSY_ORDERS_CSV))["dataset_id"]
+    steps = [{"op": "trim", "columns": ["country"]},
+             {"op": "replace_values", "columns": ["country"], "mapping": {"uk": "UK", "Uk": "UK", "USA": "US"}},
+             {"op": "change_case", "columns": ["country"], "to": "upper"},
+             {"op": "replace_values", "columns": ["country"], "mapping": {"IN": "India", "in": "India"}}]
+    plan = m.parse_table_plan({"dataset_id": ds, "table": "orders", "steps": steps})
+    warnings = [w for w in plans.validate(settings, "alice", plan)["warnings"] if "match no value" in w]
+    assert warnings == [
+        "clean.orders step 2 (replace_values): mapping key(s) 'USA', 'Uk' (did you mean 'uk'?) match no value "
+        "of 'country' in the data at this step, so they will replace nothing",
+        "clean.orders step 4 (replace_values): mapping key(s) 'in' (did you mean 'IN'?) match no value "
+        "of 'country' in the data at this step, so they will replace nothing"], warnings
+
+    every_key_matches = m.parse_table_plan({"dataset_id": ds, "table": "orders", "steps": [
+        {"op": "replace_values", "columns": ["country"], "mapping": {"uk": "UK", "in": "IN"}}]})
+    assert not [w for w in plans.validate(settings, "alice", every_key_matches)["warnings"] if "replace" in w]
+
+    monkeypatch.setattr(plans, "MAPPING_CHECK_TIMEOUT_S", 0.001)     # too slow to check: say so, still valid
+    report = plans.validate(settings, "alice", plan)
+    assert report["valid"] and any("keys were not checked against the data" in w for w in report["warnings"])
+
+
+def test_a_broken_json_string_for_steps_gets_a_precise_error_not_valid_list(base_env):
+    # live run: steps arrived as a JSON string that had lost its closing ']'; FastMCP's
+    # own JSON pre-parse skipped it and pydantic said only "Input should be a valid list"
+    from bruin_mcp_service.auth import TokenStore
+    from bruin_mcp_service.server import build_server
+    settings = load_settings(base_env)
+    settings.token_file.parent.mkdir(parents=True)
+    settings.token_file.write_text('{"tokens": []}')
+    os.chmod(settings.token_file, 0o600)
+    meta = build_server(settings, TokenStore(settings.token_file))._tool_manager._tools["validate_table_plan"].fn_metadata
+    broken = json.dumps(STEPS)[:-1]
+    args = {"dataset_id": "ds_0000000000000000", "steps": broken}
+    passed = meta.arg_model.model_validate(meta.pre_parse_json(args)).model_dump_one_level()
+    assert passed["steps"] == broken                                         # reaches the tool, not refused upstream
+    good = meta.arg_model.model_validate(meta.pre_parse_json({**args, "steps": json.dumps(STEPS)}))
+    assert good.model_dump_one_level()["steps"] == STEPS                     # a valid string still becomes a list
+    with pytest.raises(ValueError, match=r"steps is a JSON string that does not parse: .* at character \d+ .*"
+                                         r"send steps as a JSON array"):
+        m.json_argument("steps", broken)
+    assert m.json_argument("steps", STEPS) is STEPS
+
+
+@needs_bruin
 def test_steps_received_lists_every_step_and_compile_builds_exactly_the_draft(settings):
     ds = datasets.upload(settings, "alice", "synthetic_orders.csv", b64(MESSY_ORDERS_CSV))["dataset_id"]
     flat = {**FLAT, "dataset_id": ds}
     report = plans.validate(settings, "alice", m.parse_table_plan(flat))
+    # warnings come before the long parts, so a client that cuts a long reply keeps them
+    keys = list(report)
+    assert keys.index("warnings") < keys.index("steps_received") < keys.index("assets")
+    assert any("TRY_CAST" in w for w in report["warnings"])
     received = report["steps_received"]["clean.orders"]
     assert len(received) == len(STEPS)
     assert [line.split(". ", 1)[1].split(" ", 1)[0] for line in received] == [s["op"] for s in STEPS]
@@ -215,3 +267,48 @@ def test_a_mapping_key_an_earlier_step_made_impossible_is_reported():
     out = compile_plan(plan, {"orders": "/x.csv"}, {"orders": COLS})
     hits = [w for w in out.warnings if "can never match" in w]
     assert len(hits) == 1 and "'India'" in hits[0] and "INDIA" in hits[0] and "USA" not in hits[0].split("—")[0]
+
+
+@needs_bruin
+def test_validate_and_compile_replies_are_brief_and_get_pipeline_has_the_detail(settings):
+    # a 4-row join took 2.87M input tokens: each reply carried every asset's SQL and the
+    # columns after every step, and the client re-sends earlier replies on each turn
+    ds = datasets.upload(settings, "alice", "synthetic_orders.csv", b64(MESSY_ORDERS_CSV))["dataset_id"]
+    flat = {**FLAT, "dataset_id": ds, "checks": [{"column": "order_id", "check": "unique"}]}
+    report = plans.validate(settings, "alice", m.parse_table_plan(flat))
+    reply = plans.validate_reply(report)
+    assert list(reply)[:5] == ["valid", "draft_id", "plan", "warnings", "steps_received"]
+    assert reply["steps_received"] == report["steps_received"] and reply["warnings"] == report["warnings"]
+    assert reply["assets"]["raw.orders"] == {"kind": "raw", "columns": 5}
+    assert "order_id BIGINT (unique)" in reply["assets"]["clean.orders"]["columns"]
+    record = plans.build(settings, "alice", plans.load_draft(settings, "alice", report["draft_id"]))
+    built = plans.compile_reply(record)
+    assert built["pipeline_id"] == record["pipeline_id"] and built["bruin_validate"] == "passed"
+    for short, full in ((reply, report), (built, record)):
+        text = json.dumps(short)
+        assert "SELECT" not in text and str(settings.workspace_root) not in text
+        assert len(text) < len(json.dumps(full)) / 3                     # 10–12% on a 23-column file
+    shown = plans.public(settings, plans.get(settings, "alice", record["pipeline_id"]))
+    assert "CREATE TABLE clean.orders AS WITH" in shown["assets"]["clean.orders"]["rendered"]
+    assert "<workspace>/users/alice/datasets/" in shown["assets"]["raw.orders"]["sql"]
+    assert str(settings.workspace_root) not in json.dumps(shown)
+
+
+@needs_bruin
+def test_values_a_mapping_leaves_behind_that_look_like_mapped_ones_are_reported(settings):
+    # live run: 'Undergraduate' was mapped to "Bachelor's" and 3 rows of 'undergrad' stayed
+    rows = ["id,education,city"] + [f"{i},{e},{c}" for i, (e, c) in enumerate(
+        [("Undergraduate", "Pune")] * 5 + [("undergrad", "pune")] * 3 + [("Bachelors", "Delhi")] * 2 +
+        [("Diploma", "Goa")] * 4 + [("Masters", "Delhi")] + [("Master's", "Goa")])]
+    ds = datasets.upload(settings, "alice", "edu.csv", b64("\n".join(rows) + "\n"))["dataset_id"]
+    plan = m.parse_table_plan({"dataset_id": ds, "table": "people", "steps": [
+        {"op": "replace_values", "columns": ["education"],
+         "mapping": {"Undergraduate": "Bachelor's", "Masters": "Master's"}}]})
+    left = [w for w in plans.validate(settings, "alice", plan)["warnings"] if "still holds" in w]
+    assert left == ["clean.people step 1 (replace_values): after this mapping 'education' still holds 'undergrad' "
+                    "(3 rows; looks like 'Undergraduate', mapped to \"Bachelor's\"), 'Bachelors' (2 rows; looks like "
+                    "\"Bachelor's\", a value this mapping produces); add them to the mapping if they mean the same"], left
+    whole = m.parse_table_plan({"dataset_id": ds, "table": "people", "steps": [
+        {"op": "replace_values", "columns": ["education"], "mapping": {
+            "Undergraduate": "Bachelor's", "undergrad": "Bachelor's", "Bachelors": "Bachelor's", "Masters": "Master's"}}]})
+    assert not [w for w in plans.validate(settings, "alice", whole)["warnings"] if "still holds" in w]

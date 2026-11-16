@@ -378,21 +378,28 @@ def test_plan_tools_over_mcp_validate_compile_and_isolation(server):
                 {"kind": "sql", "name": "leak", "sources": ["clean.orders"],
                  "query": "SELECT * FROM read_csv('/etc/passwd')"}]}})
             built = await s.call_tool("compile_plan", {"draft_id": ok.structuredContent["draft_id"]})
+            full = (await s.call_tool("get_pipeline",
+                                      {"pipeline_id": built.structuredContent["pipeline_id"]})).structuredContent
             listed = (await s.call_tool("list_pipelines", {})).structuredContent
             saved = (await s.call_tool("list_saved_plans", {})).structuredContent
-            return ds, ok, invented, malformed, unsafe, built, listed, saved
+            return ds, ok, invented, malformed, unsafe, built, full, listed, saved
 
-    ds, ok, invented, malformed, unsafe, built, listed, saved = run(alice_flow())
+    ds, ok, invented, malformed, unsafe, built, full, listed, saved = run(alice_flow())
     draft = ok.structuredContent["draft_id"]
     assert ok.structuredContent["steps_received"]["clean.orders"][0].startswith("1. trim")
     assert not ok.isError and ok.structuredContent["valid"] is True
-    assert ok.structuredContent["assets"]["clean.orders"]["steps"][-1]["op"] == "dedupe"
+    assert "order_id BIGINT (unique)" in ok.structuredContent["assets"]["clean.orders"]["columns"]
+    assert "sql" not in json.dumps(ok.structuredContent["assets"]) and "get_pipeline" in ok.structuredContent["detail"]
     assert invented.isError and "'discount'" in invented.content[0].text
     assert malformed.isError and "expected format" in malformed.content[0].text
     assert unsafe.isError and "table functions are not allowed" in unsafe.content[0].text
     assert not built.isError and built.structuredContent["bruin_validate"] == "passed"
     pid = built.structuredContent["pipeline_id"]
-    assert "CREATE TABLE clean.orders AS WITH" in built.structuredContent["assets"]["clean.orders"]["rendered"]
+    assert "rendered" not in built.structuredContent["assets"]["clean.orders"]           # the SQL is in get_pipeline
+    assert "CREATE TABLE clean.orders AS WITH" in full["assets"]["clean.orders"]["rendered"]
+    assert full["assets"]["clean.orders"]["steps"][-1]["op"] == "dedupe"
+    assert "<workspace>/users/alice/datasets/" in full["assets"]["raw.orders"]["sql"]
+    assert str(server["root"] / "ws") not in json.dumps(full)
     assert [p["pipeline_id"] for p in listed["pipelines"]] == [pid]
     assert {p["name"] for p in saved["saved_plans"]} >= {"invoice_cleanup", "ml_split"}
 

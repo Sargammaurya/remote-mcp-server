@@ -5,7 +5,7 @@ from pydantic import ValidationError
 
 from bruin_mcp_service.plan.engine import PlanError, compile_plan
 from bruin_mcp_service.plan.model import parse_plan
-from bruin_mcp_service.plan.rawsql import SqlCheckError, check_expression, check_query
+from bruin_mcp_service.plan.rawsql import SqlCheckError, case_null_warnings, check_expression, check_query
 from bruin_mcp_service.plan.saved import SavedPlanError, instantiate, list_saved
 
 COLS = ["Order ID", "customer", "country", "amount", "Order Date"]
@@ -252,6 +252,65 @@ def test_text_maths_is_refused_exactly_when_duckdb_would_fail(expr, ok):
             check_expression(expr, TEXT_COLS)
 
 
+# a live run labelled 23 people with no age 'Boomer+': NULL < 25 matches no WHEN
+CASE_NULLS = [
+    ("CASE WHEN Age < 25 THEN 'young' ELSE 'old' END", ["Age"]),
+    ("CASE Age WHEN 1 THEN 'one' ELSE 'other' END", ["Age"]),
+    ("CASE WHEN Age < 25 AND income > 9 THEN 'a' ELSE 'b' END", ["Age", "income"]),
+    ("CASE WHEN Age IS NOT NULL AND Age < 25 THEN 'young' ELSE 'old' END", ["Age"]),
+    ("coalesce(CASE WHEN Age < 25 THEN 'young' ELSE 'old' END, 'x')", ["Age"]),
+    ("CASE WHEN Age IS NULL THEN NULL WHEN Age < 25 THEN 'young' ELSE 'old' END", []),
+    ("CASE WHEN coalesce(Age, 0) < 25 THEN 'young' ELSE 'old' END", []),
+    ("CASE WHEN Age < 25 THEN 'young' END", []),
+    ("CASE WHEN Age < 25 THEN 'young' ELSE NULL END", []),
+]
+
+
+@pytest.mark.parametrize("expr,exposed", CASE_NULLS)
+def test_case_else_that_catches_missing_values_is_warned_about(expr, exposed):
+    warnings = case_null_warnings(expr)
+    if not exposed:
+        assert warnings == []
+        return
+    assert len(warnings) == 1 and f"rows where {', '.join(exposed)} is NULL" in warnings[0]
+    assert f"WHEN {exposed[0]} IS NULL THEN NULL" in warnings[0]
+    duckdb = pytest.importorskip("duckdb")                       # and DuckDB really does send NULL to ELSE
+    got = duckdb.connect().execute(f"SELECT {expr} FROM (SELECT NULL::INT AS Age, 10 AS income)").fetchone()[0]
+    assert got is not None and got in ("old", "other", "b")
+
+
+def test_case_null_warnings_reach_the_plan_from_derive_and_sql_outputs():
+    plan = _plan([{"op": "cast", "columns": {"amount": "DOUBLE"}},
+                  {"op": "derive", "name": "size", "expression": "CASE WHEN amount < 100 THEN 'small' ELSE 'big' END"}],
+                 outputs=[{"kind": "sql", "name": "tiers", "sources": ["clean.orders"],
+                           "query": "SELECT CASE WHEN country = 'IN' THEN 'home' ELSE 'abroad' END AS tier "
+                                    "FROM clean.orders"}])
+    warnings = _compile(plan).warnings
+    assert any("derive 'size': rows where amount is NULL" in w and "'big'" in w for w in warnings), warnings
+    assert any(w.startswith("mart.tiers: rows where country is NULL") for w in warnings), warnings
+
+
+def test_an_output_of_a_failed_table_says_so_instead_of_not_an_asset():
+    # live run: a bad derive failed clean.ai_data, and its aggregate then said
+    # "source 'clean.ai_data' is not an asset of this plan" — read like a typo
+    plan = _plan([{"op": "derive", "name": "double", "expression": "amount * 2"}],
+                 outputs=[{"kind": "aggregate", "name": "by_country", "source": "clean.orders",
+                           "group_by": ["country"], "measures": [{"name": "n", "fn": "count"}]},
+                          {"kind": "sql", "name": "q", "sources": ["clean.orders", "clean.typo"],
+                           "query": "SELECT 1 AS one FROM clean.orders"},
+                          {"kind": "aggregate", "name": "of_mart", "source": "mart.by_country",
+                           "group_by": ["country"], "measures": [{"name": "n", "fn": "count"}]}])
+    problems = _problems(plan)
+    assert any("amount is text (VARCHAR)" in p for p in problems)                         # the real cause
+    assert "mart.by_country: source 'clean.orders' was not built because of the problem(s) reported " \
+           "above for it" in problems
+    assert any(p.startswith("mart.q: sources ['clean.orders'] were not built") for p in problems), problems
+    assert any(p.startswith("mart.q: sources ['clean.typo'] are not assets of this plan") for p in problems)
+    assert "mart.of_mart: source 'mart.by_country' was not built because of the problem(s) reported " \
+           "above for it" in problems
+    assert not any("'clean.orders' is not an asset" in p for p in problems)
+
+
 def test_text_maths_in_a_query_and_in_a_plan_is_caught_at_validation():
     with pytest.raises(SqlCheckError, match=r"s2 is text \(VARCHAR\), so SUM\(s2\)"):
         check_query("SELECT s, sum(s2) AS t FROM clean.o GROUP BY s", {"clean.o": TEXT_COLS})
@@ -335,3 +394,99 @@ def test_format_errors_say_what_a_step_accepts():
     text = _format_errors(e.value)
     assert "dedupe accepts: op, key (optional), order_by (optional), keep (optional)" in text
     assert "get_plan_format" in text
+
+
+# a live run: "remove cancelled orders" became status ne 'cancelled', and plain SQL <>
+# also dropped the 12 orders whose status was blank — 36 rows left instead of 48
+FILTER_NULLS = [
+    ({"column": "status", "operator": "ne", "value": "cancelled"}, [1, 3, 4]),
+    ({"column": "status", "operator": "not_in", "value": ["cancelled", "done"]}, [4]),
+    ({"column": "amount", "operator": "ne", "value": 5}, [1, 2, 3, 4]),
+    ({"all": [{"column": "status", "operator": "ne", "value": "cancelled"},
+              {"column": "status", "operator": "not_null"}]}, [1, 3]),
+    ({"column": "status", "operator": "eq", "value": "done"}, [1, 3]),
+    ({"column": "status", "operator": "in", "value": ["done", "cancelled"]}, [1, 2, 3]),
+    ({"column": "amount", "operator": "gt", "value": 9}, [2, 3]),
+]
+
+
+@pytest.mark.parametrize("where,kept", FILTER_NULLS)
+def test_ne_and_not_in_keep_rows_whose_value_is_missing(tmp_path, where, kept):
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "orders.csv"
+    path.write_text("id,status,amount\n1,done,\n2,cancelled,10\n3,done,20\n4,,3\n")
+    plan = _plan([{"op": "cast", "columns": {"id": "INTEGER", "amount": "INTEGER"}}, {"op": "filter", "where": where}])
+    c = compile_plan(plan, {"orders": str(path)}, {"orders": ["id", "status", "amount"]})
+    con = duckdb.connect()
+    con.execute("CREATE SCHEMA raw")
+    raw = next(a for a in c.assets if a.name == "raw.orders")
+    con.execute(f"CREATE TABLE raw.orders AS {raw.body}")
+    got = sorted(r[0] for r in con.execute(_clean(c).body).fetchall())
+    assert got == kept
+
+
+def test_an_unknown_source_names_its_likely_meaning_before_the_long_list():
+    # live run: an aggregate read 'clean.orders_customers' (the join output is
+    # mart.orders_customers); the client's view of the error was cut inside the known
+    # list, so it took two more tries
+    join = {"kind": "sql", "name": "orders_customers", "sources": ["clean.orders"],
+            "query": "SELECT country, amount FROM clean.orders"}
+    agg = {"kind": "aggregate", "name": "spend", "source": "clean.orders_customers",
+           "group_by": ["country"], "measures": [{"name": "n", "fn": "count"}]}
+    problem = next(p for p in _problems(_plan(outputs=[join, agg])) if p.startswith("mart.spend"))
+    assert "did you mean 'mart.orders_customers' for 'clean.orders_customers'?" in problem
+    assert problem.index("did you mean") < problem.index("(known:")
+    later = next(p for p in _problems(_plan(outputs=[{**agg, "source": "mart.orders_customers"}, join]))
+                 if p.startswith("mart.spend"))
+    assert "'mart.orders_customers' (for 'mart.orders_customers'?) is defined later in outputs" in later
+    itself = next(p for p in _problems(_plan(outputs=[{**agg, "source": "mart.spend"}])) if p.startswith("mart.spend"))
+    assert "defined later" not in itself
+    nothing = next(p for p in _problems(_plan(outputs=[{**agg, "source": "zzz"}])) if p.startswith("mart.spend"))
+    assert "'zzz' is not an asset of this plan (known:" in nothing and "did you mean" not in nothing
+
+
+@pytest.mark.parametrize("steps,expected", [
+    ([{"op": "cast", "columns": {"amount": "INTEGER"}}], [None, 3, None, None, 7, 1000]),
+    ([{"op": "cast", "columns": {"amount": "BIGINT"}}], [None, 3, None, None, 7, 1000]),
+    ([{"op": "cast", "columns": {"amount": "DOUBLE"}}, {"op": "cast", "columns": {"amount": "INTEGER"}}],
+     [None, 3, None, None, 7, 1000]),
+    ([{"op": "cast", "columns": {"amount": "DOUBLE"}}], [3.5, 3.0, None, -2.5, 7.0, 1000.0]),
+])
+def test_an_integer_cast_makes_fractions_null_instead_of_rounding_them(tmp_path, steps, expected):
+    # TRY_CAST('3.5' AS INTEGER) is 4 and '-2.5' is -3: the data changed with no sign of it
+    duckdb = pytest.importorskip("duckdb")
+    path = tmp_path / "orders.csv"
+    path.write_text("id,amount\n1,3.5\n2,3.0\n3,abc\n4,-2.5\n5, 7 \n6,1e3\n")
+    c = compile_plan(_plan([{"op": "cast", "columns": {"id": "INTEGER"}}, *steps]),
+                     {"orders": str(path)}, {"orders": ["id", "amount"]})
+    con = duckdb.connect()
+    con.execute("CREATE SCHEMA raw")
+    con.execute(f"CREATE TABLE raw.orders AS {next(a for a in c.assets if a.name == 'raw.orders').body}")
+    assert [r[1] for r in con.execute(_clean(c).body + " ORDER BY id").fetchall()] == expected
+    integer = steps[-1]["columns"]["amount"] in ("INTEGER", "BIGINT")
+    assert any("['amount'] (to a whole-number type)" in w and "not rounded" in w for w in c.warnings) is integer
+
+
+@pytest.mark.parametrize("a,b,like", [
+    ("undergrad", "Undergraduate", True), ("Bachelors", "Bachelor's", True), ("U.K.", "uk", True),
+    ("Mastres", "Masters", True), ("Male", "female", False), ("Eco", "Eco Plus", False),
+    ("Diploma", "Undergraduate", False), ("Nigeria", "india", False), ("", "x", False),
+    ("Loyal Customer", "disloyal Customer", False), ("known", "Unknown", False), ("Femal", "Female", True),
+])
+def test_looks_like_catches_spelling_variants_not_different_categories(a, b, like):
+    from bruin_mcp_service.plan.engine import looks_like
+    assert looks_like(a, b) is like
+
+
+def test_the_trace_records_what_each_value_step_rewrites_and_where_columns_came_from():
+    c = _compile(_plan([{"op": "rename", "mapping": {"Order ID": "order_id", "country": "nation"}},
+                        {"op": "trim", "columns": ["customer"]},
+                        {"op": "derive", "name": "x", "expression": "1", "type": "INTEGER"},
+                        {"op": "drop", "columns": ["amount"]}, {"op": "dedupe"},
+                        {"op": "rename", "mapping": {"nation": "cntry"}}]))
+    clean = _clean(c)
+    assert clean.origins == {"order_id": "Order ID", "customer": "customer", "cntry": "country",
+                             "Order Date": "Order Date", "x": None}
+    changed = {t["step"]: t.get("changed") for t in clean.trace}
+    assert changed[2] == {"customer": 'TRIM("customer")'}
+    assert all(changed[i] is None for i in (0, 1, 3, 4, 5, 6))         # renames, derive, drop, dedupe rewrite nothing
