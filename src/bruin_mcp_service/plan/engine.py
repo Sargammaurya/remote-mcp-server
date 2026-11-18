@@ -38,7 +38,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from . import model as m
-from .rawsql import SqlCheckError, case_null_warnings, check_expression, check_query, ensure_parses
+from .rawsql import (SqlCheckError, case_null_warnings, check_expression, check_query, ensure_parses,
+                     weekday_warnings)
 
 NUMERIC = ("BIGINT", "INTEGER", "DOUBLE")
 
@@ -341,7 +342,7 @@ def _step(step, schema: Schema, ctx: _Ctx, warnings: list) -> Optional[tuple[Sch
         elif typ == "UNKNOWN":
             ctx.fail(f"derive {step.name!r}: the type of the expression cannot be determined; give 'type'")
             return None
-        for warning in case_null_warnings(step.expression):
+        for warning in case_null_warnings(step.expression) + weekday_warnings(step.expression):
             warnings.append(f"{ctx.where}: derive {step.name!r}: {warning}")
         exprs[step.name] = f"{expr} AS {q(step.name)}"
         out.cols[step.name] = typ
@@ -438,6 +439,9 @@ class Compiled:
     exports: list[dict]
     # per cleaned table, a query that checks replace_values keys against the data (run by validate)
     mapping_probes: list[dict] = field(default_factory=list)
+    # per cleaned table, a query over the data for derived columns holding one value in
+    # every row and casts / parse_dates that turn values into NULL
+    data_probes: list[dict] = field(default_factory=list)
 
     def summary(self) -> dict:
         return {
@@ -487,6 +491,64 @@ def _mapping_probe(table: str, path: str, ctes: list[str], mapped: list) -> dict
 LEFTOVER_MAX = 200          # a column with more distinct values is not a category list; not checked
 
 
+# a check's failing rows, as Bruin counts them (NULLs fail only not_null); pattern is
+# not predicted: its exact regex semantics in Bruin were not verified
+_CHECK_FAILS = {
+    "not_null": "{c} IS NULL", "positive": "{c} <= 0", "non_negative": "{c} < 0",
+    "min": "{c} < {v}", "max": "{c} > {v}", "accepted_values": "{c} NOT IN ({vs})",
+}
+
+
+def _check_part(step: int, col: str, ctype: str, entry: dict) -> Optional[str]:
+    name, c = entry["name"], q(col)
+    if name == "unique":
+        return (f"SELECT 'check', {step}, {lit(col)}, count({c}) - count(DISTINCT {c}), count(*), {lit(name)}, "
+                f"(SELECT CAST(min(x) AS VARCHAR) FROM (SELECT {c} AS x FROM s{step - 1} WHERE {c} IS NOT NULL "
+                f"GROUP BY 1 HAVING count(*) > 1)) FROM s{step - 1}")
+    if name not in _CHECK_FAILS:
+        return None
+    value = entry.get("value")
+    values = ", ".join(_typed_lit(v, ctype) for v in value) if name == "accepted_values" else ""
+    fails = _CHECK_FAILS[name].format(c=c, v=value, vs=values)
+    return (f"SELECT 'check', {step}, {lit(col)}, count(*) FILTER (WHERE {fails}), count(*), {lit(name)}, "
+            f"CAST(min({c}) FILTER (WHERE {fails}) AS VARCHAR) FROM s{step - 1}")
+
+
+def _data_probe(table: str, path: str, ctes: list[str], derived: list, converted: list,
+                filled: list = (), checked: list = ()) -> dict:
+    """One query over the plan's own CTE chain and the real data. Rows
+    (kind, step, column, n1, n2, v1, v2):
+      'derive': n1 distinct values right after the step (NULL counted as one), n2 rows,
+        v1 one of them. A live run derived classification_correct from two identical
+        label columns: 1 in all 20,000 rows, reported as a feature.
+      'convert': n1 values a cast / parse_date turns into NULL, n2 values it was given,
+        v1 / v2 two of the failures. A live run parsed 20,000 dates '2023-09-18' with
+        '%Y-%m-%dT%H:%M:%SZ': validation passed, the run made every date NULL.
+      'fill': n1 missing values a fill_null puts a number into, n2 rows, v1 the number.
+        A live run filled 23 missing ages with 0 to pass a not_null check; its summary's
+        average ages fell, one to 0.0.
+      'check': n1 rows the check fails on, n2 rows, v1 the check, v2 a failing value
+        (step = one past the last). The same run's not_null check failed only at run time.
+    """
+    last = max(i for i, *_ in [*derived, *converted, *filled, *checked])
+    chain = [f"s0 AS MATERIALIZED (SELECT * FROM read_csv({lit(path)}, header = true, all_varchar = true))",
+             *ctes[1:min(last, len(ctes) - 1) + 1]]
+    parts = [f"SELECT 'derive' AS kind, {i} AS step, {lit(col)} AS col, count(DISTINCT {q(col)}) + "
+             f"(count(*) > count({q(col)}))::INTEGER AS n1, count(*) AS n2, CAST(min({q(col)}) AS VARCHAR) AS v1, "
+             f"NULL::VARCHAR AS v2 FROM s{i}" for i, _, col in derived]
+    parts += [f"SELECT 'convert', {i}, {lit(col)}, count(*) FILTER (WHERE o IS NOT NULL AND v IS NULL), count(o), "
+              f"min(o) FILTER (WHERE o IS NOT NULL AND v IS NULL), max(o) FILTER (WHERE o IS NOT NULL AND v IS NULL) "
+              f"FROM (SELECT CAST({q(col)} AS VARCHAR) AS o, {expr} AS v FROM s{i - 1})"
+              for i, _, col, expr in converted]
+    parts += [f"SELECT 'fill', {i}, {lit(col)}, count(*) - count({q(col)}), count(*), {lit(str(value))}, NULL "
+              f"FROM s{i - 1}" for i, _, col, value in filled]
+    parts += [p for i, _, col, ctype, entry in checked if (p := _check_part(i, col, ctype, entry))]
+    sql = "WITH\n" + ",\n".join(chain) + "\n" + "\nUNION ALL\n".join(parts) + "\nORDER BY 1, 2, 3, 6"
+    ensure_parses(sql)
+    return {"table": table, "path": path, "sql": sql,
+            "steps": {(i, col): where for i, where, col, *_ in [*derived, *converted, *filled, *checked]}}
+
+
 def _norm(text: str) -> str:
     return re.sub(r"[^0-9a-z]", "", text.lower())
 
@@ -520,6 +582,7 @@ def compile_plan(plan: m.Plan, source_paths: dict[str, str],
     schemas: dict[str, Schema] = {}
     assets: list[Asset] = []
     probes: list[dict] = []
+    data_probes: list[dict] = []
     # assets already attempted: one of them missing from `schemas` failed above, which
     # an output using it must say (live: "not an asset of this plan" read like a typo)
     attempted: set[str] = set()
@@ -550,6 +613,9 @@ def compile_plan(plan: m.Plan, source_paths: dict[str, str],
         ctes = [f"s0 AS MATERIALIZED (SELECT * FROM raw.{table.table})"]
         trace = [{"step": 0, "op": "source", "columns": schema.as_list()}]
         mapped = []                                     # (step, where, column at that step, mapping)
+        derived = []                                    # (step, where, new column)
+        converted = []                                  # (step, where, column, its cast / parse expression)
+        filled = []                                     # (step, where, numeric column, fill value)
         origins = {c: c for c in schema.cols}
         for i, step in enumerate(table.steps, 1):
             ctx.where = f"clean.{table.table} step {i} ({step.op})"
@@ -561,6 +627,12 @@ def compile_plan(plan: m.Plan, source_paths: dict[str, str],
             result = _step(step, schema, ctx, warnings)
             if result is None:
                 break
+            if isinstance(step, m.Derive):
+                derived.append((i, ctx.where, step.name))
+            elif isinstance(step, (m.Cast, m.ParseDate)):
+                converted += [(i, ctx.where, col, expr) for col, expr in ctx.changed.items()]
+            elif isinstance(step, m.FillNull) and not isinstance(step.value, bool):
+                filled += [(i, ctx.where, col, step.value) for col in ctx.changed if schema.cols.get(col) in NUMERIC]
             back = {new: old for old, new in renamed.items()}
             origins = {c: origins.get(back.get(c, c)) for c in result[0].cols}
             schema, body = result
@@ -589,6 +661,11 @@ def compile_plan(plan: m.Plan, source_paths: dict[str, str],
                             columns=_columns(schema, checks), trace=trace, origins=origins))
         if mapped:
             probes.append(_mapping_probe(table.table, source_paths[table.table], ctes, mapped))
+        after = len(table.steps) + 1
+        checked = [(after, ctx.where, col, schema.cols[col], entry) for col, entries in checks.items() for entry in entries]
+        if derived or converted or filled or checked:
+            data_probes.append(_data_probe(table.table, source_paths[table.table], ctes, derived, converted,
+                                           filled, checked))
 
     planned = {f"mart.{o.name}_{part}" for o in plan.outputs if isinstance(o, m.Split) for part in o.parts} | \
               {f"mart.{o.name}" for o in plan.outputs if not isinstance(o, m.Split)}
@@ -711,11 +788,15 @@ def compile_plan(plan: m.Plan, source_paths: dict[str, str],
     exports = []
     known = {a.name for a in assets}
     for export in plan.exports:
-        if export.asset not in known:
-            problems.append("export " + _not_assets([export.asset], known, set()))
+        if unbuilt(export.asset):
+            # live: "did you mean 'raw.hyper' for 'clean.hyper'?" — the clean table had failed above
+            problems.append(f"export {export.asset!r} was not built because of the problem(s) reported above for it")
+        elif export.asset not in known:
+            problems.append("export " + _not_assets([export.asset], known | attempted, set()))
         else:
             exports.append({"asset": export.asset, "format": export.format})
 
     if problems:
         raise PlanError(problems)
-    return Compiled(assets=assets, warnings=warnings, exports=exports, mapping_probes=probes)
+    return Compiled(assets=assets, warnings=warnings, exports=exports, mapping_probes=probes,
+                    data_probes=data_probes)

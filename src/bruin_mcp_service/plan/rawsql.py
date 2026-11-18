@@ -42,7 +42,7 @@ _APPROVED_CALLS = [
     "regexp_replace(s, 'a', 'b')", "regexp_matches(s, 'a')", "translate(s, 'a', 'b')", "left(s, 2)",
     "right(s, 2)", "lpad(s, 2, '0')", "starts_with(s, 'a')", "contains(s, 'a')", "split_part(s, ',', 1)",
     "strptime(s, '%Y')", "try_strptime(s, '%Y')", "strftime(d, '%Y')", "date_trunc('month', d)",
-    "extract(year FROM d)", "year(d)", "month(d)", "day(d)", "quarter(d)", "dayofweek(d)",
+    "extract(year FROM d)", "year(d)", "month(d)", "day(d)", "quarter(d)", "dayofweek(d)", "isodow(d)",
     "date_diff('day', d, e)", "date_add(d, INTERVAL 1 DAY)", "sum(x)", "avg(x)", "count(x)",
     "min(x)", "max(x)", "median(x)", "stddev(x)", "variance(x)", "any_value(x)", "arg_min(x, y)",
     "arg_max(x, y)", "count_if(x > 1)", "quantile_cont(x, 0.5)", "string_agg(s, ',')",
@@ -165,6 +165,19 @@ def _null_tested(node: exp.Expression, case: exp.Case) -> bool:
             return True
         parent = parent.parent
     return False
+
+
+def weekday_warnings(sql: str) -> list[str]:
+    """dayofweek(d) and extract(dow FROM d) count Sunday = 0 … Saturday = 6 (DuckDB 1.5.2,
+    checked 2026-11-16); pandas counts Monday = 0, so a live run's column looked one day off."""
+    try:
+        tree = sqlglot.parse_one(f"SELECT ({sql})", read=DIALECT)
+    except ParseError:
+        return []
+    sunday = any(tree.find_all(exp.DayOfWeek)) or any(
+        str(e.this).upper() in ("DAYOFWEEK", "DOW") for e in tree.find_all(exp.Extract))
+    return ["dayofweek counts Sunday = 0 … Saturday = 6 (pandas counts Monday = 0); say so when "
+            "reporting it, or use isodow(d) for Monday = 1 … Sunday = 7"] if sunday else []
 
 
 def case_null_warnings(sql: str) -> list[str]:

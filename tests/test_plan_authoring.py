@@ -22,7 +22,7 @@ from bruin_mcp_service import datasets
 from bruin_mcp_service.config import load_settings
 from bruin_mcp_service.plan import model as m
 from bruin_mcp_service.plan import pipeline as plans
-from bruin_mcp_service.plan.engine import compile_plan
+from bruin_mcp_service.plan.engine import PlanError, compile_plan
 from bruin_mcp_service.plan.schema import plan_tool_schema, table_plan_tool_schema
 from conftest import needs_bruin
 from synthetic import MESSY_ORDERS_CSV, b64
@@ -312,3 +312,83 @@ def test_values_a_mapping_leaves_behind_that_look_like_mapped_ones_are_reported(
         {"op": "replace_values", "columns": ["education"], "mapping": {
             "Undergraduate": "Bachelor's", "undergrad": "Bachelor's", "Bachelors": "Bachelor's", "Masters": "Master's"}}]})
     assert not [w for w in plans.validate(settings, "alice", whole)["warnings"] if "still holds" in w]
+
+
+def test_a_derived_column_with_one_value_in_every_row_is_reported(settings):
+    # live run: classification_correct compared two identical label columns — 1 in all
+    # 20,000 rows — and the summary called it a feature
+    rows = ["id,label,truth,score"] + [f"{i},{l},{l},{i % 3}" for i, l in enumerate("abcabcab")]
+    ds = datasets.upload(settings, "alice", "labels.csv", b64("\n".join(rows) + "\n"))["dataset_id"]
+    plan = m.parse_table_plan({"dataset_id": ds, "table": "t", "steps": [
+        {"op": "derive", "name": "correct", "expression": "CASE WHEN label = truth THEN 1 ELSE 0 END"},
+        {"op": "derive", "name": "high", "expression": "score = '2'"},
+        {"op": "derive", "name": "nothing", "expression": "NULL", "type": "INTEGER"}]})
+    got = [w for w in plans.validate(settings, "alice", plan)["warnings"] if "carries no information" in w]
+    assert got == ["clean.t step 1 (derive): derive 'correct' is '1' in all 8 rows, so it carries no information; "
+                   "check the columns it uses (are they identical?)",
+                   "clean.t step 3 (derive): derive 'nothing' is NULL in all 8 rows, so it carries no information; "
+                   "check the columns it uses (are they identical?)"], got
+
+
+def test_a_cast_or_parse_date_that_turns_values_into_null_is_reported_at_validation(settings):
+    # live run: dates like '2023-09-18' parsed with '%Y-%m-%dT%H:%M:%SZ' passed validation,
+    # and the run made all 20,000 of them NULL
+    rows = ["id,day,amount,email"] + [f"{i},2024-01-0{i},{a},p{i}@example.org"
+                                      for i, a in zip(range(1, 7), ["5", "6", "x", "7", "", "8"])]
+    ds = datasets.upload(settings, "alice", "dates.csv", b64("\n".join(rows) + "\n"))["dataset_id"]
+
+    def warned(steps):
+        plan = m.parse_table_plan({"dataset_id": ds, "table": "t", "steps": steps})
+        return [w for w in plans.validate(settings, "alice", plan)["warnings"] if "values do not convert and will" in w]
+
+    assert warned([{"op": "parse_date", "columns": ["day"], "formats": ["%Y-%m-%dT%H:%M:%SZ"]}]) == [
+        "clean.t step 1 (parse_date): 'day': all 6 of 6 values do not convert and will become NULL "
+        "(e.g. '2024-01-01', '2024-01-06'); check the type or the format(s) against these values"]
+    assert warned([{"op": "parse_date", "columns": ["day"], "formats": ["%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d"]}]) == []
+    # a missing value is not a failure; 'x' is
+    assert warned([{"op": "cast", "columns": {"amount": "INTEGER"}}]) == [
+        "clean.t step 1 (cast): 'amount': 1 of 5 values do not convert and will become NULL (e.g. 'x'); "
+        "check the type or the format(s) against these values"]
+    # personal values are not shown
+    assert warned([{"op": "cast", "columns": {"email": "INTEGER"}}]) == [
+        "clean.t step 1 (cast): 'email': all 6 of 6 values do not convert and will become NULL; "
+        "check the type or the format(s) against these values"]
+
+
+def test_numbers_filled_into_missing_values_and_checks_that_will_fail_are_reported(settings):
+    # live run: a not_null check on age failed at run time (23 missing); the client then
+    # filled them with 0, and its summary's average ages fell, one to 0.0
+    rows = ["id,age,tier,code"] + [f"{i},{a},{t},{c}" for i, (a, t, c) in enumerate(
+        [("30", "gold", "A1"), ("", "gold", "A1"), ("41", "silver", "B2"), ("", "tin", "C3"), ("-5", None, "D4")], 1)]
+    ds = datasets.upload(settings, "alice", "people.csv",
+                         b64("\n".join(r.replace("None", "") for r in rows) + "\n"))["dataset_id"]
+
+    def warned(steps, checks, words):
+        plan = m.parse_table_plan({"dataset_id": ds, "table": "p", "steps": steps, "checks": checks})
+        return [w for w in plans.validate(settings, "alice", plan)["warnings"] if words in w]
+
+    cast = {"op": "cast", "columns": {"age": "INTEGER"}}
+    # a check this data fails is an error, not a warning: the run would fail for certain
+    # (live: the warning was one of ten, the client compiled anyway and the run failed)
+    plan = m.parse_table_plan({"dataset_id": ds, "table": "p", "steps": [cast], "checks": [
+        {"column": "age", "check": "not_null"}, {"column": "code", "check": "unique"},
+        {"column": "tier", "check": "accepted_values", "value": ["gold", "silver"]},
+        {"column": "age", "check": "positive"}, {"column": "id", "check": "unique"}]})
+    with pytest.raises(PlanError) as err:
+        plans.validate(settings, "alice", plan)
+    assert err.value.problems == [
+        "clean.p checks: check not_null on 'age' fails on this data — 2 of 5 rows, so the run would fail; these "
+        "values are missing — if they are truly unknown, drop the check rather than filling in a made-up value",
+        "clean.p checks: check positive on 'age' fails on this data — 1 of 5 rows (e.g. '-5'), so the run would fail",
+        "clean.p checks: check unique on 'code' fails on this data — 1 of 5 rows repeat a value (e.g. 'A1'), so the "
+        "run would fail",
+        "clean.p checks: check accepted_values on 'tier' fails on this data — 1 of 5 rows (e.g. 'tin'), so the run "
+        "would fail"]
+    fill = {"op": "fill_null", "columns": ["age"], "value": 0}
+    assert warned([cast, fill], [{"column": "age", "check": "not_null"}], "missing values will become") == [
+        "clean.p step 2 (fill_null): 'age': 2 missing values will become 0, which averages, sums and models treat "
+        "as real values of 'age'; leave them NULL (averages and counts skip NULL) unless what comes next cannot "
+        "take NULL"]
+    assert warned([cast, fill], [{"column": "age", "check": "not_null"}], "fails on this data") == []
+    # a text placeholder for a missing category is fine
+    assert warned([{"op": "fill_null", "columns": ["tier"], "value": "unknown"}], [], "missing values") == []

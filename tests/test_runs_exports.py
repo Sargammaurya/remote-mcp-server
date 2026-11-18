@@ -359,3 +359,28 @@ def test_exports_carry_bounded_column_summaries(settings, built):
     assert sums["country"]["nulls"] == 2
     assert sums["customer"]["values_hidden"].startswith("masked")
     assert "order_id" not in sums                                        # not a text column
+
+
+@pytest.mark.parametrize("check,fails", [
+    ({"column": "age", "check": "not_null"}, True), ({"column": "age", "check": "positive"}, True),
+    ({"column": "age", "check": "min", "value": 0}, True), ({"column": "age", "check": "max", "value": 41}, False),
+    ({"column": "code", "check": "unique"}, True), ({"column": "id", "check": "unique"}, False),
+    # NULL tier: Bruin does not count it against accepted_values, and validate must agree
+    ({"column": "tier", "check": "accepted_values", "value": ["gold", "silver", "tin"]}, False),
+    ({"column": "tier", "check": "accepted_values", "value": ["gold", "silver"]}, True),
+])
+def test_validate_predicts_exactly_the_checks_bruin_fails(settings, check, fails):
+    rows = "id,age,tier,code\n1,30,gold,A1\n2,,gold,A1\n3,41,silver,B2\n4,,tin,C3\n5,-5,,D4\n"
+    ds = datasets.upload(settings, "alice", "people.csv", b64(rows))["dataset_id"]
+    plan = {"name": "p", "sources": [{"table": "p", "dataset_id": ds}],
+            "clean": [{"table": "p", "steps": [{"op": "cast", "columns": {"age": "INTEGER"}}], "checks": [check]}]}
+    from bruin_mcp_service.plan.model import parse_plan
+    from bruin_mcp_service.plan.engine import PlanError
+    try:
+        plans.validate(settings, "alice", parse_plan(plan))
+        predicted = False
+    except PlanError as e:
+        predicted = any("fails on this data" in p for p in e.problems)
+    record = _build(settings, "alice", plan)
+    run = _wait(settings, "alice", record["pipeline_id"], runs.start(settings, "alice", record["pipeline_id"])["run_id"])
+    assert (run["status"] == "failed") is fails and predicted is fails, (run.get("errors"), run.get("checks"))

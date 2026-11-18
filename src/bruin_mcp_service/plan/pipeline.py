@@ -35,6 +35,7 @@ from ..bruin_cli import run_bruin
 from ..bruin_query import QueryError, guarded_query, sql_string
 from ..config import Settings
 from ..paths import resolve_user_path, user_root
+from ..summaries import _looks_personal, is_sensitive_name
 from . import model as m
 from .engine import Compiled, PlanError, compile_plan, looks_like
 
@@ -115,6 +116,45 @@ def _mapping_warnings(settings: Settings, compiled: Compiled) -> list[str]:
     return out
 
 
+def _data_findings(settings: Settings, compiled: Compiled) -> tuple[list[str], list[str]]:
+    """(warnings, problems) from the data (see engine._data_probe). Warnings: derived
+    columns with one value in every row, casts / parse_dates that turn values into NULL,
+    numbers filled into missing values. Problems: checks the data already fails — the
+    run uses this same data, so it would fail for certain (live: a warning saying so was
+    one of ten, the client compiled anyway, and the run failed)."""
+    out, problems = [], []
+    for probe in compiled.data_probes:
+        try:
+            got = guarded_query(settings, Path(probe["path"]).parent, probe["sql"], timeout=MAPPING_CHECK_TIMEOUT_S)
+        except QueryError as e:
+            out.append(f"clean.{probe['table']}: casts and derived columns were not checked against the data ({e})")
+            continue
+        for kind, step, col, n1, n2, v1, v2 in got["rows"]:
+            where = probe["steps"][(int(step), col)]
+            if kind == "derive" and int(n2) > 1 and int(n1) <= 1:
+                shown = "NULL" if v1 is None else repr(v1)
+                out.append(f"{where}: derive {col!r} is {shown} in all {n2} rows, so it "
+                           f"carries no information; check the columns it uses (are they identical?)")
+            elif kind == "convert" and int(n1):
+                examples = "" if is_sensitive_name(col) or any(_looks_personal(v) for v in (v1, v2) if v) else \
+                    " (e.g. " + ", ".join(repr(v) for v in dict.fromkeys((v1, v2)) if v is not None) + ")"
+                every = "all " if int(n1) == int(n2) else ""
+                out.append(f"{where}: {col!r}: {every}{n1} of {n2} values do not convert and will become NULL"
+                           f"{examples}; check the type or the format(s) against these values")
+            elif kind == "fill" and int(n1):
+                out.append(f"{where}: {col!r}: {n1} missing values will become {v1}, which averages, sums and "
+                           f"models treat as real values of {col!r}; leave them NULL (averages and counts skip "
+                           f"NULL) unless what comes next cannot take NULL")
+            elif kind == "check" and int(n1):
+                shown = "" if v2 is None or is_sensitive_name(col) or _looks_personal(v2) else f" (e.g. {v2!r})"
+                why = ("; these values are missing — if they are truly unknown, drop the check rather than filling "
+                       "in a made-up value" if v1 == "not_null" else "")
+                rows = "rows repeat a value" if v1 == "unique" else "rows"
+                problems.append(f"{where}: check {v1} on {col!r} fails on this data — {n1} of {n2} {rows}{shown}, "
+                                f"so the run would fail{why}")
+    return out, problems
+
+
 def describe_step(step) -> str:
     """One line per requested step, so the caller can check nothing was lost."""
     data = step.model_dump(mode="json", exclude_none=True)
@@ -147,6 +187,10 @@ def validate(settings: Settings, user_id: str, plan: m.Plan) -> dict:
     compiled = compile_plan(plan, paths, schemas)
     _check_every_step_compiled(plan, compiled)
     compiled.warnings.extend(_mapping_warnings(settings, compiled))
+    warnings, problems = _data_findings(settings, compiled)
+    if problems:
+        raise PlanError(problems)
+    compiled.warnings.extend(warnings)
     draft_id = "dr_" + secrets.token_hex(8)
     path = _drafts_root(settings, user_id) / f"{draft_id}.json"
     tmp = path.with_suffix(".tmp")

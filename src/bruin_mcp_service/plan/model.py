@@ -443,7 +443,8 @@ def plan_format() -> dict:
                     "BIGINT a number with a fraction (3.5) becomes NULL, not rounded — use DOUBLE to keep it",
             "parse_date": "formats are strftime patterns tried in order; they state the day/month order",
             "dedupe": "no key: exact duplicate rows; key: one row per key, ordered by order_by, keep first|last",
-            "derive": "expression is a SQL expression over existing columns; give type if it cannot be inferred",
+            "derive": "expression is a SQL expression over existing columns; give type if it cannot be inferred; "
+                      "dayofweek(d) is Sunday = 0 … Saturday = 6, isodow(d) is Monday = 1 … Sunday = 7",
             "filter": "where is a condition (below)",
         },
         "types": list(SQL_TYPES),

@@ -311,6 +311,32 @@ def test_an_output_of_a_failed_table_says_so_instead_of_not_an_asset():
     assert not any("'clean.orders' is not an asset" in p for p in problems)
 
 
+def test_an_export_of_a_failed_table_says_so_instead_of_did_you_mean_the_raw_one():
+    # live run: a check on a text column failed clean.hyper, and its export then
+    # said "did you mean 'raw.hyper' for 'clean.hyper'?" — the uncleaned table
+    plan = _plan([{"op": "derive", "name": "double", "expression": "amount * 2"}],
+                 outputs=[{"kind": "aggregate", "name": "by_country", "source": "clean.orders",
+                           "group_by": ["country"], "measures": [{"name": "n", "fn": "count"}]}],
+                 exports=[{"asset": "clean.orders"}, {"asset": "mart.by_country"}, {"asset": "by_country"}])
+    problems = _problems(plan)
+    assert "export 'clean.orders' was not built because of the problem(s) reported above for it" in problems
+    assert "export 'mart.by_country' was not built because of the problem(s) reported above for it" in problems
+    assert any(p.startswith("export 'by_country' is not an asset of this plan — did you mean 'mart.by_country'")
+               for p in problems), problems
+    assert not any("did you mean 'raw.orders'" in p for p in problems), problems
+
+
+@pytest.mark.parametrize("expression,warned", [
+    ("dayofweek(d)", True), ("extract(dow FROM d)", True), ("dayofweek(d) IN (0, 6)", True),
+    ("isodow(d)", False), ("month(d)", False), ("extract(year FROM d)", False),
+])
+def test_a_day_of_week_derive_says_which_day_is_zero(expression, warned):
+    c = _compile(_plan([{"op": "parse_date", "columns": ["Order Date"], "formats": ["%Y-%m-%d"]},
+                        {"op": "rename", "mapping": {"Order Date": "d"}},
+                        {"op": "derive", "name": "wd", "expression": expression, "type": "INTEGER"}]))
+    assert any("derive 'wd': dayofweek counts Sunday = 0" in w for w in c.warnings) is warned, c.warnings
+
+
 def test_text_maths_in_a_query_and_in_a_plan_is_caught_at_validation():
     with pytest.raises(SqlCheckError, match=r"s2 is text \(VARCHAR\), so SUM\(s2\)"):
         check_query("SELECT s, sum(s2) AS t FROM clean.o GROUP BY s", {"clean.o": TEXT_COLS})
